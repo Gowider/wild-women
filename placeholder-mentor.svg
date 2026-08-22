@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 1000" width="900" height="1000">
+<rect width="900" height="1000" fill="#123521"/>
+<rect x="12" y="12" width="876" height="976" fill="none" stroke="#d2a24c" stroke-width="2" stroke-dasharray="10 8"/>
+<text x="50%" y="48%" text-anchor="middle" fill="#d2a24c" font-family="Georgia,serif" font-size="40" font-style="italic">Mentor photo</text>
+<text x="50%" y="56%" text-anchor="middle" fill="#f6efe2" font-family="Arial,sans-serif" font-size="18">Replace with your photo — 900×1000, WebP recommended</text>
+</svg>

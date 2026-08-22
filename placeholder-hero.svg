@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080" width="1920" height="1080">
+<rect width="1920" height="1080" fill="#123521"/>
+<rect x="12" y="12" width="1896" height="1056" fill="none" stroke="#d2a24c" stroke-width="2" stroke-dasharray="10 8"/>
+<text x="50%" y="48%" text-anchor="middle" fill="#d2a24c" font-family="Georgia,serif" font-size="86" font-style="italic">Hero photo</text>
+<text x="50%" y="56%" text-anchor="middle" fill="#f6efe2" font-family="Arial,sans-serif" font-size="38">Replace with your photo — 1920×1080, WebP recommended</text>
+</svg>

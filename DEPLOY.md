@@ -35,8 +35,8 @@ pay for uptime (Hobby starts around $5/month minimum spend).
    SSL is provisioned automatically.
 
 The container is Caddy serving static files, with gzip/zstd compression,
-long cache headers on `/assets/*`, and no-cache on the HTML so edits go live
-immediately.
+long cache headers on the images (`*.png`/`*.webp`/`*.svg`), and no-cache on
+the HTML so edits go live immediately.
 
 Local test before pushing:
 
@@ -47,9 +47,10 @@ Local test before pushing:
 
 ## Images
 
-Images are self-hosted — they live in `assets/img/` and are served by the same
-host as the page. Relative paths, so the folder works unchanged on Railway,
-Pages, or Hostinger. To swap a photo: replace the file, keep the filename, redeploy.
+Images are self-hosted — they live at the repo root alongside `index.html` and
+are served by the same host as the page. Relative paths, so the folder works
+unchanged on Railway, Pages, or Hostinger. To swap a photo: replace the file,
+keep the filename, redeploy.
 
 On Railway the images are baked into the container, so a photo change means a
 push and rebuild (a minute or two). On Pages it's a git push; on Hostinger you

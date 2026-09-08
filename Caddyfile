@@ -16,7 +16,7 @@
 		-Server
 	}
 
-	@static path /assets/* /favicon.png /og-image.png
+	@static path *.png *.webp *.svg
 	header @static Cache-Control "public, max-age=31536000, immutable"
 
 	@html path *.html /

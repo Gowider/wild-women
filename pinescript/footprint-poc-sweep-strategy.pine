@@ -1,0 +1,439 @@
+//@version=6
+strategy("Footprint POC Sweep Strategy", shorttitle="POC Sweep", overlay=true, initial_capital=1000000, currency=currency.USD, default_qty_type=strategy.fixed, default_qty_value=2, pyramiding=0, process_orders_on_close=false, max_lines_count=500, max_labels_count=500)
+
+// ═════════════════════════════════════════════════════════════════════════
+// RULES (v4 — sweep sequencing, sweep-POC entries, session VWAP exit):
+//  - Intended for the 5-minute chart.
+//  - Sweep dots: a candle that sweeps ONLY the prior high (or ONLY the prior
+//    low) prints its dot as before. A candle that sweeps BOTH sides (the
+//    "yellow" canary candle) now prints ONE dot only — the side that was
+//    swept LAST, resolved from the intrabar (Intrabar Resolution) sequence.
+//    If the intrabar data can't resolve the order, both dots print, as
+//    before, and no sweep entry is armed.
+//  - NEW — Sweep POC entry (optional, "Yellow Sweep Entries" group): on a
+//    both-swept candle, a resting LIMIT order is placed at THAT candle's own
+//    POC, in the direction of the SECOND sweep. Sweeps the prior low first
+//    and then the prior high -> LONG at the candle's POC. Sweeps the high
+//    first and then the low -> SHORT at the candle's POC. The level is
+//    fixed; it does not walk forward.
+//  - CHoCH (Change of Character): pivot-based swing high/low tracking.
+//    A bullish CHoCH = close breaks above the last confirmed swing high
+//    while structure wasn't already bullish -> draws a GREEN line, arms a
+//    LONG setup. A bearish CHoCH = close breaks below the last confirmed
+//    swing low while structure wasn't already bearish -> RED line, arms a
+//    SHORT setup. Lines are drawn at the broken swing price and extend
+//    right indefinitely.
+//  - CHoCH entry setup: on a CHoCH, a resting LIMIT order is placed at that
+//    same CHoCH candle's own POC — fixed, it does not move.
+//  - Only ONE setup is armed at a time, and only while flat. A newer setup
+//    (CHoCH or sweep, either direction) cancels and replaces the older one.
+//    CHoCH wins if both fire on the same candle. A resting order otherwise
+//    stays live until it fills (sweep orders can additionally be given a
+//    bar expiry; 0 = never expire).
+//  - Entries are only armed while the trigger candle prints inside the
+//    Entry Window (default 03:00-08:00); once armed, the resting order can
+//    fill at any time afterward.
+//  - Stop loss: 20 ticks (input). A 20-tick (input) trailing stop takes
+//    over once the trade is 5 ticks (input) in profit.
+//  - Take profit 1 — CHoCH: once in a trade, watch for the NEXT CHoCH line
+//    to print (whichever direction). The instant price touches that new
+//    line's price, flag it; the position is closed on the following candle.
+//  - Take profit 2 — NEW, session VWAP: the anchored session VWAP and its
+//    1/2/3 standard deviation bands are plotted on the chart, and the trade
+//    exits at the 1 SD band in the trade's direction (+1 SD for longs,
+//    -1 SD for shorts), either as a resting limit that rides the band or as
+//    a close-on-touch.
+//  - EOD: any open position is flattened once the clock reaches 13:55
+//    (input) America/New_York, checked live.
+//  - Size: 2 contracts (input). Account: $1,000,000 initial capital.
+// ═════════════════════════════════════════════════════════════════════════
+
+// ───────────── Inputs ─────────────
+lowerTF     = input.timeframe("1", "Intrabar Resolution", group="Data", tooltip="Lower timeframe sampled inside each candle to classify buy vs sell volume for POC, and to resolve which side of the prior candle was swept first. Must be smaller than the chart timeframe.")
+
+atrLen      = input.int(14, "ATR Length", group="Row Sizing")
+rowATRMult  = input.float(0.2, "Row Height (x ATR)", minval=0.01, step=0.01, group="Row Sizing")
+maxRows     = input.int(40, "Max Rows per Candle", minval=3, maxval=100, group="Row Sizing")
+
+requireRejection = input.bool(false, "Sweep Requires Rejection (close back inside prior range)", group="Sweep Detection")
+
+tieBreak = input.string("Skip", "If Both Sides Swept In The Same Intrabar", options=["Skip", "Use Intrabar Direction"], group="Sweep Detection", tooltip="When one intrabar candle takes out both the prior high and the prior low, the true order is unknown. 'Skip' leaves the sweep unresolved (both dots print, no sweep entry). 'Use Intrabar Direction' treats an up-closing intrabar as high-swept-last (long) and a down-closing one as low-swept-last (short).")
+
+enableSweepEntry = input.bool(true, "Enable Yellow Sweep POC Entries", group="Yellow Sweep Entries", tooltip="On a candle that sweeps both sides of the prior candle, rest a limit order at that candle's POC in the direction of the second sweep.")
+sweepExpiryBars  = input.int(0, "Cancel Sweep Limit After N Bars (0 = never)", minval=0, group="Yellow Sweep Entries")
+
+enableChochEntry = input.bool(true, "Enable CHoCH POC Entries", group="CHoCH")
+pivotLen       = input.int(5, "CHoCH Pivot Lookback (bars each side)", minval=1, group="CHoCH", tooltip="A swing high/low needs this many bars on both sides to confirm, so CHoCH detection lags by this many bars.")
+maxChochLines  = input.int(50, "Max Tracked CHoCH Lines", minval=5, maxval=200, group="CHoCH", tooltip="A CHoCH line is removed as soon as price trades back through its price (no longer 'live'), same as the POC carry lines. This just caps how many un-retested lines can be tracked at once.")
+chochUpColor   = input.color(color.new(color.lime, 0), "CHoCH Up (Bullish) Line", group="CHoCH")
+chochDownColor = input.color(color.new(color.red, 0),  "CHoCH Down (Bearish) Line", group="CHoCH")
+
+useTimeFilter = input.bool(true, "Restrict New Setups to Entry Window", group="Entry Window", tooltip="A CHoCH or sweep candle can only arm a new setup while inside this window. Once armed, the resting order (and any resulting trade) runs to completion regardless of the clock.")
+entryWindow   = input.session("0300-0800", "Entry Window", group="Entry Window")
+windowTz      = input.string("America/New_York", "Entry Window Timezone", group="Entry Window")
+
+qty = input.int(2, "Contracts", minval=1, group="Strategy")
+
+slTicks            = input.int(20, "Stop Loss (ticks)", minval=1, group="Risk")
+trailActivateTicks = input.int(5,  "Trailing Stop Activation (+ticks profit)", minval=1, group="Risk")
+trailOffsetTicks   = input.int(20, "Trailing Stop Distance (ticks)", minval=1, group="Risk")
+
+eodHour   = input.int(13, "EOD Flatten Hour (0-23)", minval=0, maxval=23, group="EOD Exit")
+eodMinute = input.int(55, "EOD Flatten Minute", minval=0, maxval=59, group="EOD Exit")
+eodTz     = input.string("America/New_York", "EOD Timezone", group="EOD Exit", tooltip="Any open position is flattened once the clock reaches this time, checked live at the Intrabar Resolution above.")
+
+// ───────────── Session VWAP inputs ─────────────
+group_vwap  = "Session VWAP"
+vwapSrc     = input.source(hlc3, "VWAP Source", group=group_vwap)
+showVWAP    = input.bool(true, "Show VWAP", group=group_vwap)
+vwapAnchorMode = input.string("Session", "Anchor", options=["Session", "Daily"], group=group_vwap, tooltip="'Session' re-anchors the VWAP at the first bar of the session below. 'Daily' re-anchors at the start of each trading day (matches the stand-alone indicator).")
+vwapSessStr = input.session("0930-1600", "VWAP Session", group=group_vwap)
+vwapTz      = input.string("America/New_York", "VWAP Session Timezone", group=group_vwap)
+hideOnDWM   = input.bool(false, "Hide on Daily/Weekly/Monthly", group=group_vwap)
+
+group_bands = "VWAP Deviation Bands"
+showBand1   = input.bool(true,  "Show 1 SD", group=group_bands)
+showBand2   = input.bool(true,  "Show 2 SD", group=group_bands)
+showBand3   = input.bool(true,  "Show 3 SD", group=group_bands)
+fillBand1   = input.bool(true,  "Fill 1 SD", group=group_bands)
+fillBand2   = input.bool(false, "Fill 2 SD", group=group_bands)
+fillBand3   = input.bool(false, "Fill 3 SD", group=group_bands)
+
+group_vwx   = "VWAP Exit"
+useVwapExit = input.bool(true, "Exit at 1 SD VWAP Band", group=group_vwx, tooltip="Longs target the +1 SD band, shorts the -1 SD band. The band moves, so the target is refreshed every bar.")
+vwapExitMode = input.string("Limit at band", "VWAP Exit Style", options=["Limit at band", "Close on touch"], group=group_vwx, tooltip="'Limit at band' rests a live limit order on the band (fills at the band price). 'Close on touch' flags the touch and closes at market on the next bar.")
+
+showPocLine   = input.bool(true, "Show POC Carry Line", group="Display")
+showTradeText = input.bool(true, "Show Entry/Exit Text", group="Display", tooltip="Turns off the strategy's entry/exit comment tags (e.g. 'CHoCH Long', 'Sweep Long', 'VWAP 1SD'). The trade arrows/markers themselves are a TradingView chart setting, not controlled by this script.")
+maxNaked    = input.int(120, "Max Tracked Carry Lines", minval=10, maxval=300, group="Display")
+pocColor    = input.color(color.new(#00e5ff, 0), "POC Line", group="Display")
+sweepUpColor   = input.color(color.new(color.lime, 0), "Swept Prior High (Dot)", group="Display")
+sweepDownColor = input.color(color.new(color.red, 0), "Swept Prior Low (Dot)", group="Display")
+bothSweptColor = input.color(color.new(color.yellow, 0), "Swept Both — Canary (Candle Body)", group="Display")
+
+// ───────────── Intrabar data ─────────────
+[iOpen, iHigh, iLow, iClose, iVolume, iTime] = request.security_lower_tf(syminfo.tickerid, lowerTF, [open, high, low, close, volume, time])
+
+// ───────────── Session VWAP + 1/2/3 SD bands ─────────────
+isHigherTF   = timeframe.isdaily or timeframe.isweekly or timeframe.ismonthly
+shouldPlotVW = not (hideOnDWM and isHigherTF)
+
+inVwapSess  = not na(time(timeframe.period, vwapSessStr, vwapTz))
+vwapSessNew = inVwapSess and not inVwapSess[1]
+vwapAnchor  = vwapAnchorMode == "Session" ? vwapSessNew : timeframe.change("1D")
+
+[vwapValue, vUpper1, vLower1] = ta.vwap(vwapSrc, vwapAnchor, 1.0)
+[vwapV2,    vUpper2, vLower2] = ta.vwap(vwapSrc, vwapAnchor, 2.0)
+[vwapV3,    vUpper3, vLower3] = ta.vwap(vwapSrc, vwapAnchor, 3.0)
+
+plotVWAP = plot(shouldPlotVW and showVWAP  ? vwapValue : na, title="VWAP",  color=color.new(color.yellow, 0), linewidth=2)
+plotU1   = plot(shouldPlotVW and showBand1 ? vUpper1   : na, title="+1 SD", color=color.new(color.aqua, 0),  linewidth=1)
+plotL1   = plot(shouldPlotVW and showBand1 ? vLower1   : na, title="-1 SD", color=color.new(color.aqua, 0),  linewidth=1)
+plotU2   = plot(shouldPlotVW and showBand2 ? vUpper2   : na, title="+2 SD", color=color.new(color.green, 0), linewidth=1)
+plotL2   = plot(shouldPlotVW and showBand2 ? vLower2   : na, title="-2 SD", color=color.new(color.green, 0), linewidth=1)
+plotU3   = plot(shouldPlotVW and showBand3 ? vUpper3   : na, title="+3 SD", color=color.new(color.red, 0),   linewidth=1)
+plotL3   = plot(shouldPlotVW and showBand3 ? vLower3   : na, title="-3 SD", color=color.new(color.red, 0),   linewidth=1)
+
+fill(plotU1, plotL1, color=fillBand1 and shouldPlotVW and showBand1 ? color.new(color.aqua, 90)  : na, title="1 SD Fill")
+fill(plotU2, plotL2, color=fillBand2 and shouldPlotVW and showBand2 ? color.new(color.green, 92) : na, title="2 SD Fill")
+fill(plotU3, plotL3, color=fillBand3 and shouldPlotVW and showBand3 ? color.new(color.red, 94)   : na, title="3 SD Fill")
+
+// ───────────── POC carry-forward line (visual only, mirrors the indicator) ─────────────
+var array<float> nakedPrice = array.new<float>(0)
+var array<line>  nakedLine  = array.new<line>(0)
+
+addNaked(price, col) =>
+    ln = line.new(time, price, time_close, price, xloc=xloc.bar_time, color=col, width=1, style=line.style_dashed)
+    array.push(nakedPrice, price)
+    array.push(nakedLine, ln)
+    while array.size(nakedPrice) > maxNaked
+        array.shift(nakedPrice)
+        line.delete(array.shift(nakedLine))
+
+manageNaked() =>
+    i = array.size(nakedPrice) - 1
+    while i >= 0
+        p  = array.get(nakedPrice, i)
+        ln = array.get(nakedLine, i)
+        line.set_x2(ln, time_close)
+        if low <= p and p <= high
+            array.remove(nakedPrice, i)
+            array.remove(nakedLine, i)
+        i -= 1
+
+manageNaked()
+
+// ───────────── CHoCH lines — same "naked until retested" lifecycle as the POC lines ─────────────
+var array<float> chochPrice = array.new<float>(0)
+var array<line>  chochLineArr = array.new<line>(0)
+
+addChoch(price, col) =>
+    ln = line.new(time, price, time_close, price, xloc=xloc.bar_time, extend=extend.right, color=col, width=2)
+    array.push(chochPrice, price)
+    array.push(chochLineArr, ln)
+    while array.size(chochPrice) > maxChochLines
+        array.shift(chochPrice)
+        line.delete(array.shift(chochLineArr))
+
+manageChoch() =>
+    i = array.size(chochPrice) - 1
+    while i >= 0
+        p  = array.get(chochPrice, i)
+        ln = array.get(chochLineArr, i)
+        if low <= p and p <= high
+            line.delete(ln)
+            array.remove(chochPrice, i)
+            array.remove(chochLineArr, i)
+        i -= 1
+
+manageChoch()
+
+atrVal = ta.atr(atrLen)
+
+// ───────────── Prior-candle sweep detection ─────────────
+sweptTop    = high > high[1]
+sweptBottom = low  < low[1]
+bullSweep = requireRejection ? (sweptTop and close < high[1]) : sweptTop
+bearSweep = requireRejection ? (sweptBottom and close > low[1]) : sweptBottom
+bothSwept = bullSweep and bearSweep
+
+// ───────────── Which side was swept LAST? (intrabar sequencing) ─────────────
+// Walk the intrabar candles in order and record the first one that takes out
+// the prior candle's high, and the first that takes out the prior candle's
+// low. Whichever happened later is the SECOND sweep — that's the one dot we
+// print on a both-swept (yellow) candle, and the direction a sweep entry takes.
+nIB   = array.size(iTime)
+prevH = high[1]
+prevL = low[1]
+
+int firstHighIdx = na
+int firstLowIdx  = na
+
+if bothSwept and nIB > 0 and not na(prevH) and not na(prevL)
+    for k = 0 to nIB - 1
+        if na(firstHighIdx) and array.get(iHigh, k) > prevH
+            firstHighIdx := k
+        if na(firstLowIdx) and array.get(iLow, k) < prevL
+            firstLowIdx := k
+        if not na(firstHighIdx) and not na(firstLowIdx)
+            break
+
+// 1 = prior HIGH swept last (long bias), -1 = prior LOW swept last (short bias), 0 = unresolved
+int lastSweepDir = 0
+if bothSwept and not na(firstHighIdx) and not na(firstLowIdx)
+    if firstHighIdx > firstLowIdx
+        lastSweepDir := 1
+    else if firstLowIdx > firstHighIdx
+        lastSweepDir := -1
+    else if tieBreak == "Use Intrabar Direction"
+        // Both extremes taken inside the same intrabar candle — infer from its direction.
+        lastSweepDir := array.get(iClose, firstHighIdx) >= array.get(iOpen, firstHighIdx) ? 1 : -1
+
+bothResolved = bothSwept and lastSweepDir != 0
+
+// On a both-swept candle, show only the LAST sweep's dot. If the order could
+// not be resolved, fall back to the old behaviour and show both.
+showUpDot   = bullSweep and (not bothResolved or lastSweepDir == 1)
+showDownDot = bearSweep and (not bothResolved or lastSweepDir == -1)
+
+plotshape(showUpDot,   title="Swept Prior High", style=shape.circle, location=location.belowbar, color=sweepUpColor,   size=size.tiny)
+plotshape(showDownDot, title="Swept Prior Low",  style=shape.circle, location=location.abovebar, color=sweepDownColor, size=size.tiny)
+barcolor(bothSwept ? bothSweptColor : na, title="Swept Both Sides (Canary)")
+
+// ───────────── Entry window (gates NEW setups only, not a resting order already placed) ─────────────
+inEntryWindow = not na(time(timeframe.period, entryWindow, windowTz))
+canArmNow     = not useTimeFilter or inEntryWindow
+
+// ───────────── CHoCH structure tracking (pivot-based, top-level so it stays in sync every bar) ─────────────
+ph = ta.pivothigh(pivotLen, pivotLen)
+pl = ta.pivotlow(pivotLen, pivotLen)
+
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+var int   structTrend   = 0   // 0 = undefined, 1 = bullish, -1 = bearish
+
+if not na(ph)
+    lastSwingHigh := ph
+if not na(pl)
+    lastSwingLow := pl
+
+// ───────────── Stop loss + trailing stop + 1 SD VWAP target, attached live every bar a position is open ─────────────
+useVwapLimit   = useVwapExit and vwapExitMode == "Limit at band"
+float vwapTgtLong  = useVwapLimit and not na(vUpper1) ? vUpper1 : na
+float vwapTgtShort = useVwapLimit and not na(vLower1) ? vLower1 : na
+
+if strategy.position_size > 0
+    strategy.exit("Long Exit", from_entry="Long", limit=vwapTgtLong, loss=slTicks, trail_points=trailActivateTicks, trail_offset=trailOffsetTicks, comment_profit=showTradeText ? "VWAP 1SD" : "", comment_loss=showTradeText ? "SL" : "", comment_trailing=showTradeText ? "Trail" : "")
+if strategy.position_size < 0
+    strategy.exit("Short Exit", from_entry="Short", limit=vwapTgtShort, loss=slTicks, trail_points=trailActivateTicks, trail_offset=trailOffsetTicks, comment_profit=showTradeText ? "VWAP 1SD" : "", comment_loss=showTradeText ? "SL" : "", comment_trailing=showTradeText ? "Trail" : "")
+
+// Close-on-touch variant of the 1 SD VWAP exit.
+if useVwapExit and vwapExitMode == "Close on touch"
+    if strategy.position_size > 0 and not na(vUpper1) and high >= vUpper1
+        strategy.close("Long", comment=showTradeText ? "VWAP 1SD" : "")
+    if strategy.position_size < 0 and not na(vLower1) and low <= vLower1
+        strategy.close("Short", comment=showTradeText ? "VWAP 1SD" : "")
+
+// ───────────── EOD flatten — fires ONCE at the moment 13:55 is crossed each ─────────────
+// day, not for the rest of the day. A plain "is it past 13:55" level check would
+// also kill any position opened later that same evening, since it stays true
+// until midnight — this edge-detects the crossing instead.
+var int  lastEodDay    = -1
+var bool eodFiredToday = false
+
+nAll = array.size(iTime)
+if nAll > 0
+    lastT = array.get(iTime, nAll - 1)
+    d = dayofmonth(lastT, eodTz)
+    if d != lastEodDay
+        lastEodDay := d
+        eodFiredToday := false
+    h = hour(lastT, eodTz)
+    m = minute(lastT, eodTz)
+    nowEOD = (h > eodHour) or (h == eodHour and m >= eodMinute)
+    if nowEOD and not eodFiredToday
+        eodFiredToday := true
+        if strategy.position_size != 0
+            strategy.close_all(comment=showTradeText ? "EOD Flatten" : "")
+
+// ───────────── POC calc, CHoCH lines, entry setup, and TP tracking — once per closed candle ─────────────
+var float pocSeries = na
+
+var float lastChochPrice = na
+var int   lastChochBar   = na
+
+var int   pendingDir      = 0     // 1 = long setup armed, -1 = short setup armed, 0 = none
+var float pendingTarget   = na
+var int   pendingFrom     = 0     // 1 = CHoCH, 2 = yellow sweep
+var int   pendingBar      = na
+
+var int   tradeEntryChochBar = na
+var float tpLevel            = na
+var bool  tpTouched          = false
+
+if barstate.isconfirmed
+    n = array.size(iClose)
+    if n > 0 and (high - low) > 0 and not na(atrVal)
+        rowH   = math.max(syminfo.mintick, atrVal * rowATRMult)
+        rawRows = int(math.ceil((high - low) / rowH))
+        numRows = int(math.min(maxRows, math.max(1, rawRows)))
+        rowH2   = (high - low) / numRows
+
+        buyBins  = array.new_float(numRows, 0.0)
+        sellBins = array.new_float(numRows, 0.0)
+
+        var int prevDir = 0
+        for k = 0 to n - 1
+            o = array.get(iOpen, k)
+            c = array.get(iClose, k)
+            v = array.get(iVolume, k)
+            dir = c > o ? 1 : c < o ? -1 : (prevDir == 0 ? 1 : prevDir)
+            prevDir := dir
+            idx = int(math.max(0, math.min(numRows - 1, math.floor((c - low) / rowH2))))
+            if dir > 0
+                array.set(buyBins, idx, array.get(buyBins, idx) + v)
+            else
+                array.set(sellBins, idx, array.get(sellBins, idx) + v)
+
+        totalBins = array.new_float(numRows, 0.0)
+        for i = 0 to numRows - 1
+            array.set(totalBins, i, array.get(buyBins, i) + array.get(sellBins, i))
+
+        pocIdx   = array.indexof(totalBins, array.max(totalBins))
+        pocPrice = low + (pocIdx + 0.5) * rowH2
+
+        pocSeries := pocPrice
+        if showPocLine
+            addNaked(pocPrice, pocColor)
+
+        // ── CHoCH detection + line ──
+        chochUp   = not na(lastSwingHigh) and close > lastSwingHigh and structTrend <= 0
+        chochDown = not na(lastSwingLow)  and close < lastSwingLow  and structTrend >= 0
+
+        if chochUp
+            structTrend := 1
+            lastChochPrice := lastSwingHigh
+            lastChochBar   := bar_index
+            addChoch(lastSwingHigh, chochUpColor)
+        if chochDown
+            structTrend := -1
+            lastChochPrice := lastSwingLow
+            lastChochBar   := bar_index
+            addChoch(lastSwingLow, chochDownColor)
+
+        // ── Entry setups. Both engines rest a LIMIT order at the trigger
+        // candle's OWN POC — fixed, no walking forward, no bars-to-wait limit
+        // (except the optional sweep expiry). Only while flat; a newer setup
+        // cancels and replaces the older one. CHoCH takes precedence if a
+        // CHoCH and a resolved sweep land on the same candle. ──
+        if strategy.position_size != 0
+            pendingDir := 0
+            pendingTarget := na
+            pendingFrom := 0
+            pendingBar := na
+
+        armedThisBar = false
+
+        if enableChochEntry and chochUp and canArmNow and strategy.position_size == 0
+            pendingDir    := 1
+            pendingTarget := pocSeries
+            pendingFrom   := 1
+            pendingBar    := bar_index
+            armedThisBar  := true
+            strategy.cancel("Long")
+            strategy.cancel("Short")
+            strategy.entry("Long", strategy.long, qty=qty, limit=pendingTarget, comment=showTradeText ? "CHoCH Long" : "")
+        else if enableChochEntry and chochDown and canArmNow and strategy.position_size == 0
+            pendingDir    := -1
+            pendingTarget := pocSeries
+            pendingFrom   := 1
+            pendingBar    := bar_index
+            armedThisBar  := true
+            strategy.cancel("Long")
+            strategy.cancel("Short")
+            strategy.entry("Short", strategy.short, qty=qty, limit=pendingTarget, comment=showTradeText ? "CHoCH Short" : "")
+
+        // ── Yellow sweep POC entry: both sides of the prior candle swept,
+        // trade the direction of the SECOND sweep, limit at this candle's POC.
+        // Low swept first then the high -> long. High first then the low -> short. ──
+        if enableSweepEntry and bothResolved and not armedThisBar and canArmNow and strategy.position_size == 0
+            pendingDir    := lastSweepDir
+            pendingTarget := pocSeries
+            pendingFrom   := 2
+            pendingBar    := bar_index
+            strategy.cancel("Long")
+            strategy.cancel("Short")
+            if lastSweepDir == 1
+                strategy.entry("Long", strategy.long, qty=qty, limit=pendingTarget, comment=showTradeText ? "Sweep Long" : "")
+            else
+                strategy.entry("Short", strategy.short, qty=qty, limit=pendingTarget, comment=showTradeText ? "Sweep Short" : "")
+
+        // ── Optional expiry for an unfilled sweep limit order ──
+        if sweepExpiryBars > 0 and pendingFrom == 2 and strategy.position_size == 0 and not na(pendingBar) and (bar_index - pendingBar) >= sweepExpiryBars
+            strategy.cancel("Long")
+            strategy.cancel("Short")
+            pendingDir := 0
+            pendingTarget := na
+            pendingFrom := 0
+            pendingBar := na
+
+        // ── Take profit: exit on the candle AFTER price touches the NEXT CHoCH line ──
+        if strategy.position_size != 0 and tpTouched
+            strategy.close_all(comment=showTradeText ? "CHoCH TP" : "")
+            tpTouched := false
+            tpLevel := na
+            tradeEntryChochBar := na
+
+        if strategy.position_size != 0
+            if na(tradeEntryChochBar)
+                tradeEntryChochBar := lastChochBar
+            if na(tpLevel) and not na(lastChochBar) and not na(tradeEntryChochBar) and lastChochBar > tradeEntryChochBar
+                tpLevel := lastChochPrice
+            if not na(tpLevel) and not tpTouched
+                touchedNow = strategy.position_size > 0 ? high >= tpLevel : low <= tpLevel
+                if touchedNow
+                    tpTouched := true
+        else
+            tpTouched := false
+            tpLevel := na
+            tradeEntryChochBar := na

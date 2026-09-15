@@ -1,0 +1,303 @@
+//@version=5
+// =============================================================================
+// Triple Supertrend + 49 SMA  —  session-window intraday strategy
+//
+// Entry   : all three Supertrends (12/3, 10/1, 11/2) agree on direction
+//           AND price closes on the correct side of the 49 SMA
+//           AND that SMA confirmation happens within 60 minutes of the
+//               moment the three Supertrends first lined up
+//           AND the bar falls inside one of the four trading windows.
+// Stop    : 20 ticks from fill (each window carries its own tick setting).
+// Exit    : any one of the three Supertrends changes colour
+//           / stop loss
+//           / hard end-of-day exit at 15:30
+//           / optional hard time exit at the end of each window.
+//
+// Supertrend maths is a direct port of the classic KivancOzbilgic v4 study,
+// so the lines on this strategy match that indicator bar for bar.
+// =============================================================================
+
+strategy("Triple Supertrend + 49 SMA (Session Windows)", shorttitle="3xST+SMA49",
+     overlay               = true,
+     pyramiding            = 0,
+     initial_capital       = 25000,
+     default_qty_type      = strategy.fixed,
+     default_qty_value     = 1,
+     calc_on_every_tick    = false,
+     process_orders_on_close = true)
+
+// ---------------------------------------------------------------------------
+// Inputs — Supertrends
+// ---------------------------------------------------------------------------
+var string G_ST = "Supertrends"
+stSrc      = input.source(hl2,  "Source",                            group = G_ST)
+useAtrFunc = input.bool(true,   "Use ATR() (RMA) instead of SMA(TR)", group = G_ST)
+
+p1 = input.int(12,   "ST 1  ATR",        minval = 1,   inline = "st1", group = G_ST)
+m1 = input.float(3.0, "  x",             step   = 0.1, inline = "st1", group = G_ST)
+p2 = input.int(10,   "ST 2  ATR",        minval = 1,   inline = "st2", group = G_ST)
+m2 = input.float(1.0, "  x",             step   = 0.1, inline = "st2", group = G_ST)
+p3 = input.int(11,   "ST 3  ATR",        minval = 1,   inline = "st3", group = G_ST)
+m3 = input.float(2.0, "  x",             step   = 0.1, inline = "st3", group = G_ST)
+
+// ---------------------------------------------------------------------------
+// Inputs — SMA entry filter
+// ---------------------------------------------------------------------------
+var string G_SMA = "49 SMA entry filter"
+smaSrc     = input.source(close, "SMA source",                              group = G_SMA)
+smaLen     = input.int(49,       "SMA length",             minval = 1,      group = G_SMA)
+confirmMin = input.int(60,       "Minutes allowed for the SMA to confirm",
+     minval = 0, tooltip = "After the three Supertrends line up, price has this long to close on the correct side of the SMA. 0 = the SMA must already agree on the alignment bar.", group = G_SMA)
+oneShot    = input.bool(true,    "Only one entry per alignment",
+     tooltip = "Blocks a re-entry after a stop-out until the Supertrends line up again from scratch.", group = G_SMA)
+
+// ---------------------------------------------------------------------------
+// Inputs — trading windows
+// ---------------------------------------------------------------------------
+var string G_W = "Trading windows (HHMM)"
+tzMode = input.string("Exchange", "Timezone", group = G_W,
+     options = ["Exchange", "America/New_York", "America/Chicago", "America/Los_Angeles", "Europe/London", "Europe/Berlin", "Asia/Tokyo", "Asia/Shanghai", "UTC"])
+
+w1on = input.bool(true, "1", inline = "w1", group = G_W)
+w1s  = input.string("2145", "", inline = "w1", group = G_W)
+w1e  = input.string("0445", "", inline = "w1", group = G_W)
+w2on = input.bool(true, "2", inline = "w2", group = G_W)
+w2s  = input.string("0545", "", inline = "w2", group = G_W)
+w2e  = input.string("0815", "", inline = "w2", group = G_W)
+w3on = input.bool(true, "3", inline = "w3", group = G_W)
+w3s  = input.string("1030", "", inline = "w3", group = G_W)
+w3e  = input.string("1130", "", inline = "w3", group = G_W)
+w4on = input.bool(true, "4", inline = "w4", group = G_W)
+w4s  = input.string("1400", "", inline = "w4", group = G_W)
+w4e  = input.string("1445", "", inline = "w4", group = G_W)
+shadeWin = input.bool(true, "Shade the windows on the chart", group = G_W)
+
+// ---------------------------------------------------------------------------
+// Inputs — stops and hard exits
+// ---------------------------------------------------------------------------
+var string G_R = "Stops and hard exits"
+sl1 = input.float(20, "Window 1 stop (ticks)", minval = 1, step = 1, group = G_R)
+sl2 = input.float(20, "Window 2 stop (ticks)", minval = 1, step = 1, group = G_R)
+sl3 = input.float(20, "Window 3 stop (ticks)", minval = 1, step = 1, group = G_R)
+sl4 = input.float(20, "Window 4 stop (ticks)", minval = 1, step = 1, group = G_R)
+exitOnFlip  = input.bool(true, "Exit when any one Supertrend changes colour", group = G_R)
+useWinClose = input.bool(false, "Force flat at the end of the entry window",
+     tooltip = "Off by default: trades are allowed to run past the window that opened them, up to the EOD time below.", group = G_R)
+eodOn = input.bool(true, "Hard EOD exit", inline = "eod", group = G_R)
+eodT  = input.string("1530", "",          inline = "eod", group = G_R)
+
+// ---------------------------------------------------------------------------
+// Inputs — chart labels
+// ---------------------------------------------------------------------------
+var string G_L = "Labels"
+showAgreeLbl = input.bool(true, "Label 3-Supertrend agreement (Buy / Sell)", group = G_L)
+showConfLbl  = input.bool(true, "Label the 49 SMA confirmation (Confirmed)", group = G_L)
+lblSize      = input.string("Small", "Label size", options = ["Tiny", "Small", "Normal", "Large"], group = G_L)
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+tz = tzMode == "Exchange" ? syminfo.timezone : tzMode
+
+// "1430" -> 14 / 30
+f_hh(s) => int(nz(str.tonumber(str.substring(s, 0, 2)), 0))
+f_mm(s) => int(nz(str.tonumber(str.substring(s, 2, 4)), 0))
+
+// true on the bar that closes at (or first closes past) HH:MM in `tz`
+f_hit(hh, mm) =>
+    t = timestamp(tz, year(time, tz), month(time, tz), dayofmonth(time, tz), hh, mm, 0)
+    time_close >= t and time_close[1] < t
+
+// session strings for the four windows (":1234567" = every day, so an
+// overnight window such as 2145-0445 rolls across midnight correctly)
+sess1 = w1s + "-" + w1e + ":1234567"
+sess2 = w2s + "-" + w2e + ":1234567"
+sess3 = w3s + "-" + w3e + ":1234567"
+sess4 = w4s + "-" + w4e + ":1234567"
+
+// Supertrend — straight port of the v4 study
+f_st(src, periods, mult) =>
+    float atrSma = ta.sma(ta.tr, periods)
+    float atrVal = useAtrFunc ? ta.atr(periods) : atrSma
+    float up  = src - mult * atrVal
+    float up1 = nz(up[1], up)
+    up := close[1] > up1 ? math.max(up, up1) : up
+    float dn  = src + mult * atrVal
+    float dn1 = nz(dn[1], dn)
+    dn := close[1] < dn1 ? math.min(dn, dn1) : dn
+    int trend = 1
+    trend := nz(trend[1], trend)
+    trend := trend == -1 and close > dn1 ? 1 : trend == 1 and close < up1 ? -1 : trend
+    [trend, up, dn]
+
+// ---------------------------------------------------------------------------
+// Indicators
+// ---------------------------------------------------------------------------
+[t1, up1v, dn1v] = f_st(stSrc, p1, m1)
+[t2, up2v, dn2v] = f_st(stSrc, p2, m2)
+[t3, up3v, dn3v] = f_st(stSrc, p3, m3)
+
+sma49 = ta.sma(smaSrc, smaLen)
+
+allLong  = t1 ==  1 and t2 ==  1 and t3 ==  1
+allShort = t1 == -1 and t2 == -1 and t3 == -1
+
+// ---------------------------------------------------------------------------
+// Alignment clock — the three Supertrends line up, the SMA has `confirmMin`
+// minutes to agree with them.
+// ---------------------------------------------------------------------------
+barSec      = timeframe.in_seconds(timeframe.period)
+confirmBars = math.max(0, math.floor(confirmMin * 60 / barSec))
+
+curDir = allLong ? 1 : allShort ? -1 : 0
+
+var int  alignDir  = 0
+var int  alignBar  = 0
+var bool alignUsed = false
+var bool confDone  = false
+
+if curDir != alignDir
+    alignDir  := curDir
+    alignBar  := bar_index
+    alignUsed := false
+    confDone  := false
+
+barsSinceAlign = bar_index - alignBar
+inConfirmWin   = alignDir != 0 and barsSinceAlign <= confirmBars
+
+// the bar the three Supertrends first line up on
+agreeNow  = alignDir != 0 and alignDir != nz(alignDir[1])
+
+// the first bar inside that one-hour window where price closes on the correct
+// side of the 49 SMA — the confirmation the entry waits for
+smaAgrees  = alignDir == 1 ? close > sma49 : alignDir == -1 ? close < sma49 : false
+confirmNow = inConfirmWin and smaAgrees and not confDone
+if confirmNow
+    confDone := true
+
+// ---------------------------------------------------------------------------
+// Trading windows
+// ---------------------------------------------------------------------------
+inW1 = w1on and not na(time(timeframe.period, sess1, tz))
+inW2 = w2on and not na(time(timeframe.period, sess2, tz))
+inW3 = w3on and not na(time(timeframe.period, sess3, tz))
+inW4 = w4on and not na(time(timeframe.period, sess4, tz))
+
+activeWin = inW1 ? 1 : inW2 ? 2 : inW3 ? 3 : inW4 ? 4 : 0
+inAnyWin  = activeWin != 0
+
+// ---------------------------------------------------------------------------
+// Hard time exits
+// ---------------------------------------------------------------------------
+eodRaw = f_hit(f_hh(eodT), f_mm(eodT))
+eodHit = eodOn and eodRaw
+
+// every window end is evaluated on every bar (Pine keeps function history
+// consistent only when the call is unconditional), then the one belonging to
+// the open trade is selected.
+w1End = f_hit(f_hh(w1e), f_mm(w1e))
+w2End = f_hit(f_hh(w2e), f_mm(w2e))
+w3End = f_hit(f_hh(w3e), f_mm(w3e))
+w4End = f_hit(f_hh(w4e), f_mm(w4e))
+
+// ---------------------------------------------------------------------------
+// Entries
+// ---------------------------------------------------------------------------
+smaLongOk  = close > sma49
+smaShortOk = close < sma49
+
+flat = strategy.position_size == 0
+entryAllowed = flat and inAnyWin and not eodHit and barstate.isconfirmed and
+     (not oneShot or not alignUsed)
+
+longSignal  = entryAllowed and alignDir ==  1 and inConfirmWin and smaLongOk
+shortSignal = entryAllowed and alignDir == -1 and inConfirmWin and smaShortOk
+
+var int entryWin = 0
+
+if longSignal
+    entryWin  := activeWin
+    alignUsed := true
+    strategy.entry("Long", strategy.long)
+
+if shortSignal
+    entryWin  := activeWin
+    alignUsed := true
+    strategy.entry("Short", strategy.short)
+
+// ---------------------------------------------------------------------------
+// Exits
+// ---------------------------------------------------------------------------
+winEndHit = useWinClose and strategy.position_size != 0 and
+     (entryWin == 1 ? w1End : entryWin == 2 ? w2End : entryWin == 3 ? w3End : entryWin == 4 ? w4End : false)
+
+slTicks = entryWin == 1 ? sl1 : entryWin == 2 ? sl2 : entryWin == 3 ? sl3 : entryWin == 4 ? sl4 : sl1
+slDist  = slTicks * syminfo.mintick
+
+if strategy.position_size > 0
+    strategy.exit("L stop", from_entry = "Long",  stop = strategy.position_avg_price - slDist)
+if strategy.position_size < 0
+    strategy.exit("S stop", from_entry = "Short", stop = strategy.position_avg_price + slDist)
+
+flipLong  = exitOnFlip and strategy.position_size > 0 and not allLong
+flipShort = exitOnFlip and strategy.position_size < 0 and not allShort
+
+if flipLong
+    strategy.close("Long", comment = "ST flip")
+if flipShort
+    strategy.close("Short", comment = "ST flip")
+
+if strategy.position_size != 0 and (eodHit or winEndHit)
+    strategy.close_all(comment = eodHit ? "EOD" : "Window close")
+
+// ---------------------------------------------------------------------------
+// Plots
+// ---------------------------------------------------------------------------
+plot(t1 ==  1 ? up1v : na, "ST1 up",   color = color.new(color.green, 0),  style = plot.style_linebr, linewidth = 2)
+plot(t1 == -1 ? dn1v : na, "ST1 down", color = color.new(color.red,   0),  style = plot.style_linebr, linewidth = 2)
+plot(t2 ==  1 ? up2v : na, "ST2 up",   color = color.new(color.green, 40), style = plot.style_linebr, linewidth = 1)
+plot(t2 == -1 ? dn2v : na, "ST2 down", color = color.new(color.red,   40), style = plot.style_linebr, linewidth = 1)
+plot(t3 ==  1 ? up3v : na, "ST3 up",   color = color.new(color.green, 40), style = plot.style_linebr, linewidth = 1)
+plot(t3 == -1 ? dn3v : na, "ST3 down", color = color.new(color.red,   40), style = plot.style_linebr, linewidth = 1)
+
+plot(sma49, "49 SMA", color = color.new(color.orange, 0), linewidth = 2)
+
+bgcolor(shadeWin and inAnyWin ? color.new(color.blue, 92) : na, title = "Trading window")
+bgcolor(allLong ? color.new(color.green, 88) : allShort ? color.new(color.red, 88) : na, title = "Supertrend agreement")
+
+lblSizeVal = lblSize == "Tiny" ? size.tiny : lblSize == "Normal" ? size.normal : lblSize == "Large" ? size.large : size.small
+
+// when agreement and confirmation land on the same bar, stack the second label
+// clear of the first instead of drawing it on top
+lblOffs = nz(ta.atr(14), syminfo.mintick * 10)
+confY   = alignDir == 1 ? low  - (agreeNow ? 1.6 : 0.6) * lblOffs
+     :                    high + (agreeNow ? 1.6 : 0.6) * lblOffs
+
+if showAgreeLbl and agreeNow
+    label.new(bar_index, alignDir == 1 ? low : high,
+         text      = alignDir == 1 ? "Buy" : "Sell",
+         style     = alignDir == 1 ? label.style_label_up : label.style_label_down,
+         yloc      = alignDir == 1 ? yloc.belowbar : yloc.abovebar,
+         color     = alignDir == 1 ? color.new(color.green, 0) : color.new(color.red, 0),
+         textcolor = color.white, size = lblSizeVal)
+
+if showConfLbl and confirmNow
+    label.new(bar_index, confY,
+         text      = "Confirmed",
+         style     = alignDir == 1 ? label.style_label_up : label.style_label_down,
+         yloc      = yloc.price,
+         color     = color.new(color.blue, 0),
+         textcolor = color.white, size = lblSizeVal)
+
+plotshape(longSignal,  "Long entry",  location = location.belowbar, style = shape.triangleup,   size = size.tiny, color = color.new(color.green, 0))
+plotshape(shortSignal, "Short entry", location = location.abovebar, style = shape.triangledown, size = size.tiny, color = color.new(color.red, 0))
+
+// ---------------------------------------------------------------------------
+// Alerts
+// ---------------------------------------------------------------------------
+alertcondition(longSignal,  "Long entry",  "3xST + SMA49: long entry")
+alertcondition(shortSignal, "Short entry", "3xST + SMA49: short entry")
+alertcondition(flipLong or flipShort, "Supertrend flip exit", "3xST + SMA49: a Supertrend changed colour — exit")
+alertcondition(eodHit, "EOD exit", "3xST + SMA49: hard EOD exit")
+alertcondition(agreeNow,   "Supertrend agreement", "3xST + SMA49: all three Supertrends agree")
+alertcondition(confirmNow, "SMA confirmation",     "3xST + SMA49: 49 SMA confirmed the trend direction")

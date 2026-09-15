@@ -1,0 +1,529 @@
+//@version=6
+strategy("Footprint POC Sweep Strategy v2", shorttitle="POC Swept v2", overlay=true,
+     initial_capital=1000000, currency=currency.USD,
+     default_qty_type=strategy.fixed, default_qty_value=2,
+     pyramiding=0, process_orders_on_close=false,
+     max_lines_count=500, max_labels_count=500, max_boxes_count=200, max_bars_back=500)
+
+// ═════════════════════════════════════════════════════════════════════════
+// WHAT CHANGED vs v1 — and why
+//
+// v1 had three problems that together produced "we miss the big moves and
+// stop out too quickly":
+//
+// 1. THE CLUSTER EXIT FIRED ON EVERY BAR.
+//    v1: pocCluster3 = (max-min of 3 POCs) <= 5% of price.
+//    At MES ~7650, 5% is ~383 points. Three consecutive 15m POCs are always
+//    within 383 points, so the condition was true on essentially every bar
+//    and closed every position one bar after entry. Tolerance is now measured
+//    in ATR or ticks — units that match the thing being measured — and the
+//    cluster exit is OFF by default because clustering is a SETUP, not an exit.
+//
+// 2. THE STOP WAS INSIDE THE NOISE.
+//    20 ticks = 5.00 points, against a 15m ATR of roughly 8-15 points on this
+//    contract. Stops are now ATR-scaled and/or structural (beyond the signal
+//    candle), with a tick floor.
+//
+// 3. THE SETUP NEVER ARMED AT THE TURNS WE WANTED.
+//    v1 only traded a "yellow" candle (swept BOTH sides of the prior bar).
+//    Neither the Sunday 21:00 rollover nor the Tuesday 05:00 low printed one,
+//    so nothing was armed for either move. v2 adds two setups that do fire
+//    there, and makes direction a function of how the candle RESOLVES rather
+//    than a blind counter-trend rule:
+//
+//      A. BALANCE BREAK — N consecutive POCs inside a tight band = balance.
+//         Arm an OCO bracket around it and take the break in its direction.
+//         This is the Sunday 18:30-21:00 balance at the highs breaking down
+//         at 21:00, and the Tuesday 04:30-06:00 balance breaking up.
+//
+//      B. SWEEP REVERSAL — a sweep of the prior bar's high or low (either one
+//         side or both) that REJECTS: closes back inside the prior range and
+//         on the correct side of its own POC. This is the Tuesday 04:45 low
+//         (the green "swept prior low" dots v1 plotted but never traded).
+//
+//    Direction comes from close location within the signal candle's range and
+//    from close vs. that candle's POC (value acceptance). v1's fixed
+//    counter-trend rule is preserved as an option for A/B testing.
+//
+// Plus: the initial stop is now attached at order-placement time (v1 only
+// attached it on a later bar, leaving the entry bar unprotected), scale-out
+// and an ATR/POC trail let a winner actually run, and a stopped-out setup can
+// re-arm inside its window instead of needing a whole new signal.
+// ═════════════════════════════════════════════════════════════════════════
+
+
+// ───────────────────────────── Data ─────────────────────────────
+lowerTF = input.timeframe("1", "Intrabar Resolution", group="Data",
+     tooltip="Lower timeframe sampled inside each candle to classify buy vs sell volume for the POC. Must be smaller than the chart timeframe.")
+
+// ────────────────────────── Row sizing ──────────────────────────
+atrLen     = input.int(14, "ATR Length", minval=1, group="Row Sizing")
+rowATRMult = input.float(0.2, "Row Height (x ATR)", minval=0.01, step=0.01, group="Row Sizing")
+maxRows    = input.int(40, "Max Rows per Candle", minval=3, maxval=100, group="Row Sizing")
+
+// ──────────────────────────── Setups ────────────────────────────
+useBalance = input.bool(true, "Setup A: Balance Break (POC compression -> trade the break)", group="Setups",
+     tooltip="Arms an OCO bracket around a cluster of POCs and enters on the break. This is what catches the Sunday 21:00 breakdown and the Tuesday 05:00 flip.")
+useSweep   = input.bool(true, "Setup B: Sweep Reversal (sweep + rejection)", group="Setups")
+useYellow  = input.bool(true, "  ...include both-side (yellow) sweeps", group="Setups")
+useSingle  = input.bool(true, "  ...include single-side sweeps", group="Setups",
+     tooltip="v1 ignored these. The Tuesday 04:45 low was a single-side sweep of the prior low with a rejection close.")
+
+// ─────────────────────────── Balance ────────────────────────────
+balLen       = input.int(3, "Balance: consecutive POCs", minval=2, maxval=12, group="Balance Break")
+balTolMode   = input.string("ATR", "Balance: tolerance units", options=["ATR", "Ticks"], group="Balance Break")
+balTolATR    = input.float(0.6, "Balance: tolerance (x ATR)", minval=0.05, step=0.05, group="Balance Break")
+balTolTicks  = input.int(24, "Balance: tolerance (ticks)", minval=1, group="Balance Break")
+balRangeATR  = input.float(2.5, "Balance: max price range (x ATR)", minval=0.5, step=0.1, group="Balance Break",
+     tooltip="Second condition on top of POC compression. Without it, a fast trending window whose POCs happen to land close together would be mislabelled as balance.")
+balBufTicks  = input.int(2, "Balance: trigger buffer (ticks beyond range)", minval=0, group="Balance Break")
+balValidBars = input.int(8, "Balance: bars the bracket stays armed", minval=1, group="Balance Break")
+balShowBox   = input.bool(true, "Balance: shade the box", group="Balance Break")
+
+// ──────────────────────────── Sweep ─────────────────────────────
+requireRejection = input.bool(true, "Sweep must reject (close back inside prior range)", group="Sweep",
+     tooltip="v1 defaulted this OFF, so any bar making a new high counted as a sweep. A sweep without rejection is just trend.")
+dirMode = input.string("Auto (resolution)", "Sweep direction logic",
+     options=["Auto (resolution)", "Counter-trend (v1 legacy)", "Trend-following"], group="Sweep",
+     tooltip="Auto reads how the candle resolved: where it closed in its own range, and whether it closed above or below its own POC.")
+closeLocThresh = input.float(0.15, "Auto: close-location threshold", minval=0.0, maxval=0.45, step=0.01, group="Sweep",
+     tooltip="Close must be this far from mid-range (as a fraction of the candle) to declare a winner. 0.15 = close in the top 35% or bottom 35%.")
+requirePocSide = input.bool(true, "Auto: close must also be on the correct side of the candle's POC", group="Sweep")
+ambigMode = input.string("Skip", "Auto: ambiguous resolution", options=["Skip", "Bracket both sides", "POC trend"], group="Sweep")
+trendLookback = input.int(4, "POC trend lookback (bars)", minval=2, maxval=20, group="Sweep")
+sweepBufTicks = input.int(2, "Sweep: trigger buffer (ticks beyond extreme)", minval=0, group="Sweep")
+sweepValidBars = input.int(4, "Sweep: bars the order stays armed", minval=1, group="Sweep")
+
+// ───────────────────────────── Risk ─────────────────────────────
+qty          = input.int(2, "Contracts", minval=1, group="Risk")
+stopMode     = input.string("Wider of ATR / structure", "Initial stop",
+     options=["Wider of ATR / structure", "ATR only", "Structure only", "Fixed ticks (v1)"], group="Risk")
+stopATRMult  = input.float(1.2, "Stop: x ATR", minval=0.1, step=0.1, group="Risk")
+stopStructBuf= input.int(4, "Stop: ticks beyond signal candle", minval=0, group="Risk")
+stopFixedTicks = input.int(20, "Stop: fixed ticks (v1 mode)", minval=1, group="Risk")
+stopMinTicks = input.int(12, "Stop: minimum ticks", minval=1, group="Risk",
+     tooltip="Floor so a tiny signal candle can't produce a stop that sits inside the spread/noise.")
+stopMaxTicks = input.int(120, "Stop: maximum ticks (0 = no cap)", minval=0, group="Risk")
+
+// ───────────────────────────── Exits ────────────────────────────
+useTP1      = input.bool(true, "Scale out part of the position at a target", group="Exits")
+tp1R        = input.float(1.5, "  Target 1 (R multiple)", minval=0.1, step=0.1, group="Exits")
+tp1Qty      = input.int(1, "  Contracts to exit at target 1", minval=1, group="Exits")
+
+useBE       = input.bool(true, "Move to breakeven", group="Exits")
+beTrigR     = input.float(1.0, "  Breakeven trigger (R)", minval=0.1, step=0.1, group="Exits")
+beOffTicks  = input.int(2, "  Breakeven offset (ticks)", minval=0, group="Exits")
+
+useTrail    = input.bool(true, "Trail the runner", group="Exits")
+trailMode   = input.string("ATR", "  Trail basis", options=["ATR", "POC"], group="Exits")
+trailStartR = input.float(1.0, "  Trail activates at (R)", minval=0.0, step=0.1, group="Exits")
+trailATRMult= input.float(1.5, "  Trail distance (x ATR)", minval=0.1, step=0.1, group="Exits")
+trailPocLen = input.int(2, "  Trail behind POC of N bars", minval=1, maxval=10, group="Exits")
+trailPocBuf = input.int(4, "  Trail POC buffer (ticks)", minval=0, group="Exits")
+
+useClusterExit = input.bool(false, "Exit on POC cluster (v1 rule, now in sane units)", group="Exits",
+     tooltip="OFF by default. In v1 this was 5% of PRICE (~383 pts on MES) so it was true on every bar and closed every trade immediately. Clustering is better used as a setup.")
+clusterMode     = input.string("ATR", "  Cluster tolerance units", options=["ATR", "Ticks"], group="Exits")
+clusterATRMult  = input.float(0.35, "  Cluster tolerance (x ATR)", minval=0.05, step=0.05, group="Exits")
+clusterTicks    = input.int(16, "  Cluster tolerance (ticks)", minval=1, group="Exits")
+clusterMinBars  = input.int(3, "  Cluster exit: min bars in trade", minval=1, group="Exits")
+clusterNotRunning = input.bool(true, "  Skip cluster exit once trade is past trail trigger", group="Exits")
+
+exitOnOppYellow = input.bool(true, "Exit when a sweep resolves AGAINST the position", group="Exits",
+     tooltip="v1 exited on ANY new yellow candle, including ones confirming the trade. This only exits on opposing resolution.")
+allowReverse    = input.bool(true, "Allow stop-and-reverse on an opposite signal", group="Exits",
+     tooltip="This is the 'flip to the long' behaviour: a short can reverse straight into a long on an opposing setup.")
+maxBarsInTrade  = input.int(0, "Max bars in trade (0 = off)", minval=0, group="Exits")
+maxReEntries    = input.int(1, "Re-arm after a stop-out (times per setup)", minval=0, maxval=5, group="Exits",
+     tooltip="If the break fails and stops out but the setup window is still open, re-arm the same trigger. Stops the strategy from sitting out the real move after one shakeout.")
+
+// ──────────────────────────── Session ───────────────────────────
+useSession  = input.bool(false, "Restrict entries to a session", group="Session")
+sessionSpec = input.session("1800-1600", "Session", group="Session")
+sessionTZ   = input.string("America/New_York", "Timezone", group="Session")
+
+// ──────────────────────────── Display ───────────────────────────
+showPocLine   = input.bool(true, "Show POC carry lines", group="Display")
+showTradeText = input.bool(true, "Show entry/exit text", group="Display")
+showState     = input.bool(true, "Show state table", group="Display")
+maxNaked      = input.int(120, "Max tracked carry lines", minval=10, maxval=300, group="Display")
+pocColor      = input.color(color.new(#00e5ff, 0), "POC Line", group="Display")
+sweepUpColor  = input.color(color.new(color.lime, 0), "Swept Prior High (Dot)", group="Display")
+sweepDownColor= input.color(color.new(color.red, 0), "Swept Prior Low (Dot)", group="Display")
+bothSweptColor= input.color(color.new(color.yellow, 0), "Swept Both (Candle Body)", group="Display")
+balBoxColor   = input.color(color.new(color.orange, 85), "Balance Box", group="Display")
+
+tick = syminfo.mintick
+atrVal = ta.atr(atrLen)
+
+
+// ═══════════════════ POC engine (per candle) ═══════════════════
+[iOpen, iClose, iVolume] = request.security_lower_tf(syminfo.tickerid, lowerTF, [open, close, volume])
+
+var array<float> nakedPrice = array.new<float>(0)
+var array<line>  nakedLine  = array.new<line>(0)
+
+addNaked(price, col) =>
+    ln = line.new(time, price, time_close, price, xloc=xloc.bar_time, color=col, width=1, style=line.style_dashed)
+    array.push(nakedPrice, price)
+    array.push(nakedLine, ln)
+    while array.size(nakedPrice) > maxNaked
+        array.shift(nakedPrice)
+        line.delete(array.shift(nakedLine))
+
+manageNaked() =>
+    i = array.size(nakedPrice) - 1
+    while i >= 0
+        p  = array.get(nakedPrice, i)
+        ln = array.get(nakedLine, i)
+        line.set_x2(ln, time_close)
+        if low <= p and p <= high
+            array.remove(nakedPrice, i)
+            array.remove(nakedLine, i)
+        i -= 1
+
+manageNaked()
+
+// pocSeries carries forward; it is written once per confirmed bar so that
+// pocSeries[n] indexes cleanly as a per-bar series.
+var float pocSeries = na
+
+if barstate.isconfirmed
+    n = array.size(iClose)
+    if n > 0 and (high - low) > 0 and not na(atrVal)
+        rowH    = math.max(tick, atrVal * rowATRMult)
+        rawRows = int(math.ceil((high - low) / rowH))
+        numRows = int(math.min(maxRows, math.max(1, rawRows)))
+        rowH2   = (high - low) / numRows
+
+        buyBins  = array.new_float(numRows, 0.0)
+        sellBins = array.new_float(numRows, 0.0)
+
+        // NOTE: v1 declared this `var`, so an unresolved doji direction leaked
+        // from one candle into the next. It must reset per candle.
+        int prevDir = 0
+        for k = 0 to n - 1
+            o = array.get(iOpen, k)
+            c = array.get(iClose, k)
+            v = array.get(iVolume, k)
+            dir = c > o ? 1 : c < o ? -1 : (prevDir == 0 ? 1 : prevDir)
+            prevDir := dir
+            idx = int(math.max(0, math.min(numRows - 1, math.floor((c - low) / rowH2))))
+            if dir > 0
+                array.set(buyBins, idx, array.get(buyBins, idx) + v)
+            else
+                array.set(sellBins, idx, array.get(sellBins, idx) + v)
+
+        totalBins = array.new_float(numRows, 0.0)
+        for i = 0 to numRows - 1
+            array.set(totalBins, i, array.get(buyBins, i) + array.get(sellBins, i))
+
+        pocIdx   = array.indexof(totalBins, array.max(totalBins))
+        pocPrice = low + (pocIdx + 0.5) * rowH2
+
+        pocSeries := pocPrice
+        if showPocLine
+            addNaked(pocPrice, pocColor)
+
+// Filled POC series so ta.* helpers below stay defined from the first bars.
+pocF = na(pocSeries) ? hl2 : pocSeries
+
+
+// ═══════════════════ Derived series (top level) ═══════════════════
+// These must be evaluated on every bar, not inside a conditional, so their
+// internal history stays consistent.
+pocHi = ta.highest(pocF, balLen)
+pocLo = ta.lowest(pocF, balLen)
+balHi = ta.highest(high, balLen)
+balLo = ta.lowest(low, balLen)
+
+trailPocHi = ta.highest(pocF, trailPocLen)
+trailPocLo = ta.lowest(pocF, trailPocLen)
+
+p0 = pocF
+p1 = pocF[1]
+p2 = pocF[2]
+poc3Range = math.max(p0, math.max(p1, p2)) - math.min(p0, math.min(p1, p2))
+
+balTol     = balTolMode == "ATR" ? atrVal * balTolATR : balTolTicks * tick
+clusterTol = clusterMode == "ATR" ? atrVal * clusterATRMult : clusterTicks * tick
+
+inSession = not useSession or not na(time(timeframe.period, sessionSpec, sessionTZ))
+
+
+// ═══════════════════ Sweep classification ═══════════════════
+// Raw sweeps drive the VISUALS, so the dots and yellow bars keep matching the
+// v1 chart. The rejection filter applies only to what gets traded.
+sweptTop    = high > high[1]
+sweptBottom = low  < low[1]
+bothSweptRaw = sweptTop and sweptBottom
+
+bullSweep = requireRejection ? (sweptTop and close < high[1]) : sweptTop
+bearSweep = requireRejection ? (sweptBottom and close > low[1]) : sweptBottom
+bothSwept = bullSweep and bearSweep
+anySweep  = bullSweep or bearSweep
+
+rng      = high - low
+closeLoc = rng > 0 ? (close - low) / rng : 0.5   // 0 = closed on the low, 1 = on the high
+
+// How did the candle resolve? Sellers win a sweep that closes low in its own
+// range and below its own POC; buyers win the mirror image.
+sellersWon = closeLoc <= (0.5 - closeLocThresh) and (not requirePocSide or close < pocF)
+buyersWon  = closeLoc >= (0.5 + closeLocThresh) and (not requirePocSide or close > pocF)
+
+pocTrendUp   = not na(pocF[trendLookback]) and pocF[1] > pocF[trendLookback]
+pocTrendDown = not na(pocF[trendLookback]) and pocF[1] < pocF[trendLookback]
+
+// Direction for a sweep signal: +1 long, -1 short, 0 none, 2 = bracket both.
+sweepDir() =>
+    int d = 0
+    if dirMode == "Counter-trend (v1 legacy)"
+        d := pocTrendUp ? -1 : pocTrendDown ? 1 : 0
+    else if dirMode == "Trend-following"
+        d := pocTrendUp ? 1 : pocTrendDown ? -1 : 0
+    else
+        if buyersWon
+            d := 1
+        else if sellersWon
+            d := -1
+        else
+            d := ambigMode == "Bracket both sides" ? 2 : ambigMode == "POC trend" ? (pocTrendUp ? 1 : pocTrendDown ? -1 : 0) : 0
+    d
+
+sweepQualifies = useSweep and ((bothSwept and useYellow) or (anySweep and not bothSwept and useSingle))
+
+
+// ═══════════════════ Balance detection ═══════════════════
+// Balance = POCs compressed INTO a band AND the price range over the same
+// window contained. Both conditions, or a trend leg can masquerade as balance.
+pocCompressed = (pocHi - pocLo) <= balTol
+rangeContained = (balHi - balLo) <= balRangeATR * atrVal
+isBalance = useBalance and bar_index > balLen + 2 and not na(atrVal) and pocCompressed and rangeContained
+balJustFormed = isBalance and not isBalance[1]
+
+
+// ═══════════════════ Armed-setup state ═══════════════════
+var bool  sigActive   = false
+var int   sigBar      = na
+var int   sigKind     = 0       // 1 = balance, 2 = sweep
+var int   sigValid    = 0
+var float trigLong    = na
+var float trigShort   = na
+var float slLong      = na
+var float slShort     = na
+var bool  armLong     = false
+var bool  armShort    = false
+var bool  ordersLive  = false
+var int   reUsed      = 0
+var box   balBox      = na
+
+// Position state
+var float entryPx    = na
+var float curStop    = na
+var float rSize      = na
+var int   tradeDir   = 0
+var int   barsInTrade= 0
+
+posDir   = strategy.position_size > 0 ? 1 : strategy.position_size < 0 ? -1 : 0
+newTrade = posDir != 0 and posDir != nz(posDir[1], 0)
+flat     = posDir == 0
+
+// Stop distance for a signal candle, given direction.
+stopDist(int dir, float trigger) =>
+    float atrD = atrVal * stopATRMult
+    float strD = dir > 0 ? (trigger - (low - stopStructBuf * tick)) : ((high + stopStructBuf * tick) - trigger)
+    float d = switch stopMode
+        "ATR only"       => atrD
+        "Structure only" => strD
+        "Fixed ticks (v1)" => stopFixedTicks * tick
+        => math.max(atrD, strD)
+    d := math.max(d, stopMinTicks * tick)
+    if stopMaxTicks > 0
+        d := math.min(d, stopMaxTicks * tick)
+    d
+
+placeOrders(bool doLong, bool doShort, string tag) =>
+    if doLong and not na(trigLong)
+        strategy.entry("L", strategy.long, qty=qty, stop=trigLong, comment = showTradeText ? tag + " Long" : "")
+        // Attach protection at placement time. v1 only attached a stop on a
+        // LATER bar, so a fill left the position naked for the entry bar.
+        strategy.exit("L-Stop", from_entry="L", stop=slLong)
+    if doShort and not na(trigShort)
+        strategy.entry("S", strategy.short, qty=qty, stop=trigShort, comment = showTradeText ? tag + " Short" : "")
+        strategy.exit("S-Stop", from_entry="S", stop=slShort)
+
+cancelAll() =>
+    strategy.cancel("L")
+    strategy.cancel("S")
+
+
+// ═══════════════════ Main per-candle logic ═══════════════════
+if barstate.isconfirmed and not na(atrVal)
+
+    // ── 1. Expire / re-arm the current setup ──
+    if sigActive
+        if bar_index - sigBar > sigValid
+            cancelAll()
+            sigActive := false
+            ordersLive := false
+        else if flat and not ordersLive and reUsed < maxReEntries
+            // Stopped out but the window is still open: put the trigger back.
+            reUsed += 1
+            placeOrders(armLong, armShort, "Re-arm")
+            ordersLive := true
+
+    // ── 2. Detect a new setup ──
+    bool newSetup = false
+    int  wantDir  = 0
+    string tag    = ""
+
+    // Setup B: sweep reversal (checked first; it is the more specific signal)
+    if sweepQualifies and inSession
+        d = sweepDir()
+        if d != 0
+            newSetup := true
+            wantDir  := d
+            sigKind  := 2
+            sigValid := sweepValidBars
+            tag      := bothSwept ? "Yellow Sweep" : "Sweep"
+            trigLong  := high + sweepBufTicks * tick
+            trigShort := low  - sweepBufTicks * tick
+
+    // Setup A: balance break (only if no sweep signal on this bar)
+    if not newSetup and isBalance and inSession and flat
+        // Re-arm continuously while the balance persists so the bracket tracks
+        // the current edges of the range.
+        if balJustFormed or not sigActive or sigKind == 1
+            newSetup := true
+            wantDir  := 2                    // bracket both sides, market picks
+            sigKind  := 1
+            sigValid := balValidBars
+            tag      := "Balance Break"
+            trigLong  := balHi + balBufTicks * tick
+            trigShort := balLo - balBufTicks * tick
+
+    if newSetup
+        sigActive := true
+        sigBar    := bar_index
+        reUsed    := 0
+        armLong   := wantDir == 1 or wantDir == 2
+        armShort  := wantDir == -1 or wantDir == 2
+
+        slLong  := na(trigLong)  ? na : trigLong  - stopDist(1, trigLong)
+        slShort := na(trigShort) ? na : trigShort + stopDist(-1, trigShort)
+
+        // With pyramiding=0 any entry while in a position is a reversal,
+        // so if reversing is off there is nothing to arm.
+        if not flat and not allowReverse
+            armLong  := false
+            armShort := false
+
+        cancelAll()
+        placeOrders(armLong, armShort, tag)
+        ordersLive := armLong or armShort
+
+        if showTradeText
+            if armLong and armShort
+                label.new(bar_index, low, tag + "\nOCO both sides", style=label.style_label_up,
+                     color=color.new(color.orange, 25), textcolor=color.white, size=size.tiny)
+            else if armLong
+                label.new(bar_index, low, tag + "\nLONG", style=label.style_label_up,
+                     color=color.new(color.lime, 20), textcolor=color.black, size=size.tiny)
+            else if armShort
+                label.new(bar_index, high, tag + "\nSHORT", style=label.style_label_down,
+                     color=color.new(color.red, 20), textcolor=color.white, size=size.tiny)
+
+    // Balance box visual
+    if balShowBox
+        if isBalance and not na(balHi)
+            if na(balBox) or not isBalance[1]
+                balBox := box.new(bar_index - balLen + 1, balHi, bar_index, balLo,
+                     border_color=color.new(color.orange, 40), bgcolor=balBoxColor)
+            else
+                box.set_right(balBox, bar_index)
+                box.set_top(balBox, math.max(box.get_top(balBox), balHi))
+                box.set_bottom(balBox, math.min(box.get_bottom(balBox), balLo))
+        else
+            balBox := na
+
+    // ── 3. New fill: initialise trade state ──
+    if newTrade
+        entryPx     := strategy.position_avg_price
+        tradeDir    := posDir
+        barsInTrade := 0
+        ordersLive  := false
+        float planned = tradeDir > 0 ? slLong : slShort
+        if na(planned)
+            planned := tradeDir > 0 ? entryPx - stopDist(1, entryPx) : entryPx + stopDist(-1, entryPx)
+        curStop := planned
+        rSize   := math.max(math.abs(entryPx - curStop), tick)
+        // The other side of an OCO bracket is done once one side fills.
+        if tradeDir > 0
+            strategy.cancel("S")
+        else
+            strategy.cancel("L")
+
+    // ── 4. Manage an open position ──
+    if posDir != 0
+        barsInTrade += 1
+        float rMult = tradeDir > 0 ? (close - entryPx) / rSize : (entryPx - close) / rSize
+
+        if useBE and rMult >= beTrigR
+            float bePx = tradeDir > 0 ? entryPx + beOffTicks * tick : entryPx - beOffTicks * tick
+            curStop := tradeDir > 0 ? math.max(curStop, bePx) : math.min(curStop, bePx)
+
+        if useTrail and rMult >= trailStartR
+            float cand = na
+            if trailMode == "ATR"
+                cand := tradeDir > 0 ? high - atrVal * trailATRMult : low + atrVal * trailATRMult
+            else
+                cand := tradeDir > 0 ? trailPocLo - trailPocBuf * tick : trailPocHi + trailPocBuf * tick
+            if not na(cand)
+                curStop := tradeDir > 0 ? math.max(curStop, cand) : math.min(curStop, cand)
+
+        // Discretionary exits
+        bool running = useTrail and rMult >= trailStartR
+        bool clusterHit = useClusterExit and poc3Range <= clusterTol and barsInTrade >= clusterMinBars and not (clusterNotRunning and running)
+        bool oppSweep = exitOnOppYellow and anySweep and ((tradeDir > 0 and sellersWon) or (tradeDir < 0 and buyersWon))
+        bool timeUp   = maxBarsInTrade > 0 and barsInTrade >= maxBarsInTrade
+
+        if clusterHit or oppSweep or timeUp
+            strategy.close_all(comment = showTradeText ? (clusterHit ? "POC Cluster" : oppSweep ? "Opposing Sweep" : "Time") : "")
+        else
+            string eid = tradeDir > 0 ? "L" : "S"
+            int tp1n = math.min(tp1Qty, qty - 1)
+            if useTP1 and tp1n > 0
+                float tpPx = tradeDir > 0 ? entryPx + tp1R * rSize : entryPx - tp1R * rSize
+                strategy.exit(eid + "-TP1", from_entry=eid, qty=tp1n, limit=tpPx, comment = showTradeText ? "TP1" : "")
+            strategy.exit(eid + "-Stop", from_entry=eid, stop=curStop, comment = showTradeText ? "Stop/Trail" : "")
+    else
+        tradeDir    := 0
+        barsInTrade := 0
+
+
+// ═══════════════════ Plots ═══════════════════
+plotshape(sweptTop,    title="Swept Prior High", style=shape.circle, location=location.belowbar, color=sweepUpColor, size=size.tiny)
+plotshape(sweptBottom, title="Swept Prior Low",  style=shape.circle, location=location.abovebar, color=sweepDownColor, size=size.tiny)
+barcolor(bothSweptRaw ? bothSweptColor : na, title="Swept Both Sides")
+// Qualifying sweeps (swept AND rejected) get an extra marker so you can see
+// which candles the strategy will actually act on.
+plotshape(sweepQualifies and sellersWon, title="Qualifying Bear Sweep", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0), size=size.small)
+plotshape(sweepQualifies and buyersWon,  title="Qualifying Bull Sweep", style=shape.triangleup,   location=location.belowbar, color=color.new(color.lime, 0), size=size.small)
+plot(strategy.position_size != 0 ? curStop : na, "Active Stop", color=color.new(color.fuchsia, 0), style=plot.style_linebr, linewidth=2)
+
+if showState and barstate.islast
+    var table t = table.new(position.top_right, 2, 7, border_width=1)
+    table.cell(t, 0, 0, "State", bgcolor=color.new(color.gray, 70), text_color=color.white, text_size=size.tiny)
+    table.cell(t, 1, 0, sigActive ? (sigKind == 1 ? "Balance armed" : "Sweep armed") : "—", text_color=color.white, text_size=size.tiny)
+    table.cell(t, 0, 1, "ATR", text_color=color.white, text_size=size.tiny)
+    table.cell(t, 1, 1, str.tostring(atrVal, "#.##"), text_color=color.white, text_size=size.tiny)
+    table.cell(t, 0, 2, "Balance tol", text_color=color.white, text_size=size.tiny)
+    table.cell(t, 1, 2, str.tostring(balTol, "#.##"), text_color=color.white, text_size=size.tiny)
+    table.cell(t, 0, 3, "3-POC range", text_color=color.white, text_size=size.tiny)
+    table.cell(t, 1, 3, str.tostring(poc3Range, "#.##"), text_color=color.white, text_size=size.tiny)
+    table.cell(t, 0, 4, "Trig L / S", text_color=color.white, text_size=size.tiny)
+    table.cell(t, 1, 4, str.tostring(trigLong, "#.##") + " / " + str.tostring(trigShort, "#.##"), text_color=color.white, text_size=size.tiny)
+    table.cell(t, 0, 5, "Stop", text_color=color.white, text_size=size.tiny)
+    table.cell(t, 1, 5, strategy.position_size != 0 ? str.tostring(curStop, "#.##") : "—", text_color=color.white, text_size=size.tiny)
+    table.cell(t, 0, 6, "R size", text_color=color.white, text_size=size.tiny)
+    table.cell(t, 1, 6, strategy.position_size != 0 ? str.tostring(rSize, "#.##") : "—", text_color=color.white, text_size=size.tiny)

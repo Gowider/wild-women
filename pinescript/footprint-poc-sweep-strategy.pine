@@ -2,20 +2,26 @@
 strategy("Footprint POC Sweep Strategy", shorttitle="POC Sweep", overlay=true, initial_capital=1000000, currency=currency.USD, default_qty_type=strategy.fixed, default_qty_value=2, pyramiding=0, process_orders_on_close=false, max_lines_count=500, max_labels_count=500)
 
 // ═════════════════════════════════════════════════════════════════════════
-// RULES (v4 — sweep sequencing, sweep-POC entries, session VWAP exit):
-//  - Intended for the 5-minute chart.
+// RULES (v5 — VWAP-directional sweep entries, POC close-confirmation):
+//  - Intended for the 9-minute chart.
 //  - Sweep dots: a candle that sweeps ONLY the prior high (or ONLY the prior
 //    low) prints its dot as before. A candle that sweeps BOTH sides (the
-//    "yellow" canary candle) now prints ONE dot only — the side that was
-//    swept LAST, resolved from the intrabar (Intrabar Resolution) sequence.
-//    If the intrabar data can't resolve the order, both dots print, as
-//    before, and no sweep entry is armed.
-//  - NEW — Sweep POC entry (optional, "Yellow Sweep Entries" group): on a
-//    both-swept candle, a resting LIMIT order is placed at THAT candle's own
-//    POC, in the direction of the SECOND sweep. Sweeps the prior low first
-//    and then the prior high -> LONG at the candle's POC. Sweeps the high
-//    first and then the low -> SHORT at the candle's POC. The level is
-//    fixed; it does not walk forward.
+//    "yellow" canary candle) prints ONE dot only — the side that was swept
+//    LAST, resolved from the intrabar (Intrabar Resolution) sequence. If the
+//    intrabar data can't resolve the order, both dots print, as before. The
+//    dot is display only; it no longer decides trade direction.
+//  - Yellow sweep entry ("Yellow Sweep Entries" group) — DIRECTION IS SET BY
+//    THE SESSION VWAP, not by the sweep order: a both-swept candle sitting
+//    BELOW the VWAP arms a LONG, one sitting ABOVE the VWAP arms a SHORT.
+//    "Below/above" is measured by the Sweep Direction Reference input
+//    (candle POC by default).
+//  - Yellow sweep TRIGGER: the setup is armed, not entered. It takes ONE
+//    LATER CANDLE CLOSING beyond that sweep candle's own POC to fire — a
+//    close ABOVE the POC triggers the long, a close BELOW it triggers the
+//    short. Entry is at market on the next candle, so the fill is at or
+//    beyond the POC in the trade's direction. The armed POC is fixed; it
+//    does not walk forward. An optional bar expiry cancels an armed setup
+//    that never gets its confirming close (0 = never expire).
 //  - CHoCH (Change of Character): pivot-based swing high/low tracking.
 //    A bullish CHoCH = close breaks above the last confirmed swing high
 //    while structure wasn't already bullish -> draws a GREEN line, arms a
@@ -24,25 +30,25 @@ strategy("Footprint POC Sweep Strategy", shorttitle="POC Sweep", overlay=true, i
 //    SHORT setup. Lines are drawn at the broken swing price and extend
 //    right indefinitely.
 //  - CHoCH entry setup: on a CHoCH, a resting LIMIT order is placed at that
-//    same CHoCH candle's own POC — fixed, it does not move.
-//  - Only ONE setup is armed at a time, and only while flat. A newer setup
+//    same CHoCH candle's own POC — fixed, it does not move, and it stays
+//    live until it fills.
+//  - Only ONE setup is live at a time, and only while flat. A newer setup
 //    (CHoCH or sweep, either direction) cancels and replaces the older one.
-//    CHoCH wins if both fire on the same candle. A resting order otherwise
-//    stays live until it fills (sweep orders can additionally be given a
-//    bar expiry; 0 = never expire).
-//  - Entries are only armed while the trigger candle prints inside the
-//    Entry Window (default 03:00-08:00); once armed, the resting order can
-//    fill at any time afterward.
+//    CHoCH wins if both arm on the same candle; a sweep entry that triggers
+//    on a candle blocks any new setup from arming on that same candle.
+//  - Setups are only armed while the trigger candle prints inside the
+//    Entry Window (default 03:00-08:00); once armed, the confirming close
+//    (or the CHoCH limit fill) can come at any time afterward.
 //  - Stop loss: 20 ticks (input). A 20-tick (input) trailing stop takes
 //    over once the trade is 5 ticks (input) in profit.
 //  - Take profit 1 — CHoCH: once in a trade, watch for the NEXT CHoCH line
 //    to print (whichever direction). The instant price touches that new
 //    line's price, flag it; the position is closed on the following candle.
-//  - Take profit 2 — NEW, session VWAP: the anchored session VWAP and its
-//    1/2/3 standard deviation bands are plotted on the chart, and the trade
-//    exits at the 1 SD band in the trade's direction (+1 SD for longs,
-//    -1 SD for shorts), either as a resting limit that rides the band or as
-//    a close-on-touch.
+//  - Take profit 2 — session VWAP: the anchored session VWAP and its 1/2/3
+//    standard deviation bands are plotted on the chart, and the trade exits
+//    at the 1 SD band in the trade's direction (+1 SD for longs, -1 SD for
+//    shorts), either as a resting limit that rides the band or as a
+//    close-on-touch.
 //  - EOD: any open position is flattened once the clock reaches 13:55
 //    (input) America/New_York, checked live.
 //  - Size: 2 contracts (input). Account: $1,000,000 initial capital.
@@ -57,10 +63,15 @@ maxRows     = input.int(40, "Max Rows per Candle", minval=3, maxval=100, group="
 
 requireRejection = input.bool(false, "Sweep Requires Rejection (close back inside prior range)", group="Sweep Detection")
 
-tieBreak = input.string("Skip", "If Both Sides Swept In The Same Intrabar", options=["Skip", "Use Intrabar Direction"], group="Sweep Detection", tooltip="When one intrabar candle takes out both the prior high and the prior low, the true order is unknown. 'Skip' leaves the sweep unresolved (both dots print, no sweep entry). 'Use Intrabar Direction' treats an up-closing intrabar as high-swept-last (long) and a down-closing one as low-swept-last (short).")
+tieBreak = input.string("Skip", "If Both Sides Swept In The Same Intrabar", options=["Skip", "Use Intrabar Direction"], group="Sweep Detection", tooltip="When one intrabar candle takes out both the prior high and the prior low, the true order is unknown. 'Skip' leaves the sweep unresolved, so both dots print. 'Use Intrabar Direction' treats an up-closing intrabar as high-swept-last and a down-closing one as low-swept-last. This only affects the dot, and the optional 'Require Second Sweep To Agree' filter — trade direction comes from the VWAP.")
 
-enableSweepEntry = input.bool(true, "Enable Yellow Sweep POC Entries", group="Yellow Sweep Entries", tooltip="On a candle that sweeps both sides of the prior candle, rest a limit order at that candle's POC in the direction of the second sweep.")
-sweepExpiryBars  = input.int(0, "Cancel Sweep Limit After N Bars (0 = never)", minval=0, group="Yellow Sweep Entries")
+enableSweepEntry = input.bool(true, "Enable Yellow Sweep POC Entries", group="Yellow Sweep Entries", tooltip="On a candle that sweeps both sides of the prior candle, arm a setup at that candle's POC. Direction comes from where the sweep sits relative to the session VWAP: below the VWAP arms a long, above it arms a short. The setup fires only when a later candle CLOSES beyond that POC.")
+sweepDirRef      = input.string("Candle POC", "Sweep Direction Reference", options=["Candle POC", "Candle Close", "Whole Candle"], group="Yellow Sweep Entries", tooltip="What counts as the sweep being 'below' or 'above' the VWAP. 'Candle POC' compares the sweep candle's POC (the trigger level itself) to the VWAP. 'Candle Close' uses its close. 'Whole Candle' is strict — the entire candle range must sit on one side of the VWAP, otherwise nothing is armed.")
+requireSweepAgree = input.bool(false, "Also Require Second Sweep To Agree", group="Yellow Sweep Entries", tooltip="Optional extra filter: only arm when the last-swept side (the dot) points the same way as the VWAP direction — i.e. swept the low last while below the VWAP is skipped.")
+sweepExpiryBars  = input.int(0, "Cancel Armed Sweep Setup After N Bars (0 = never)", minval=0, group="Yellow Sweep Entries", tooltip="How many candles the armed setup waits for its confirming close beyond the POC before it is dropped.")
+clearArmAtEod    = input.bool(true, "Drop Armed Sweep Setup at EOD Flatten", group="Yellow Sweep Entries", tooltip="Clears any armed-but-untriggered sweep level when the EOD flatten fires, so a stale level can't trigger a market entry days later. CHoCH limit orders are unaffected.")
+showArmedLevel   = input.bool(true, "Show Armed Sweep POC Trigger Level", group="Yellow Sweep Entries")
+armedLevelColor  = input.color(color.new(color.orange, 0), "Armed Sweep POC Color", group="Yellow Sweep Entries")
 
 enableChochEntry = input.bool(true, "Enable CHoCH POC Entries", group="CHoCH")
 pivotLen       = input.int(5, "CHoCH Pivot Lookback (bars each side)", minval=1, group="CHoCH", tooltip="A swing high/low needs this many bars on both sides to confirm, so CHoCH detection lags by this many bars.")
@@ -87,7 +98,7 @@ group_vwap  = "Session VWAP"
 vwapSrc     = input.source(hlc3, "VWAP Source", group=group_vwap)
 showVWAP    = input.bool(true, "Show VWAP", group=group_vwap)
 vwapAnchorMode = input.string("Session", "Anchor", options=["Session", "Daily"], group=group_vwap, tooltip="'Session' re-anchors the VWAP at the first bar of the session below. 'Daily' re-anchors at the start of each trading day (matches the stand-alone indicator).")
-vwapSessStr = input.session("0930-1600", "VWAP Session", group=group_vwap)
+vwapSessStr = input.session("1800-1700", "VWAP Session", group=group_vwap, tooltip="Session the VWAP anchors to when Anchor = Session. Default 18:00-17:00 is the overnight futures session, so the VWAP is already meaningful during the 03:00-08:00 entry window. Use 0930-1600 for an RTH-only VWAP, or switch Anchor to Daily.")
 vwapTz      = input.string("America/New_York", "VWAP Session Timezone", group=group_vwap)
 hideOnDWM   = input.bool(false, "Hide on Daily/Weekly/Monthly", group=group_vwap)
 
@@ -274,6 +285,11 @@ if useVwapExit and vwapExitMode == "Close on touch"
     if strategy.position_size < 0 and not na(vLower1) and low <= vLower1
         strategy.close("Short", comment=showTradeText ? "VWAP 1SD" : "")
 
+// Armed yellow-sweep setup awaiting its confirming close beyond the POC.
+var int   sweepArmDir = 0    // 1 = waiting for a close ABOVE sweepArmPoc, -1 = waiting for a close BELOW it
+var float sweepArmPoc = na
+var int   sweepArmBar = na
+
 // ───────────── EOD flatten — fires ONCE at the moment 13:55 is crossed each ─────────────
 // day, not for the rest of the day. A plain "is it past 13:55" level check would
 // also kill any position opened later that same evening, since it stays true
@@ -295,6 +311,10 @@ if nAll > 0
         eodFiredToday := true
         if strategy.position_size != 0
             strategy.close_all(comment=showTradeText ? "EOD Flatten" : "")
+        if clearArmAtEod
+            sweepArmDir := 0
+            sweepArmPoc := na
+            sweepArmBar := na
 
 // ───────────── POC calc, CHoCH lines, entry setup, and TP tracking — once per closed candle ─────────────
 var float pocSeries = na
@@ -307,11 +327,60 @@ var float pendingTarget   = na
 var int   pendingFrom     = 0     // 1 = CHoCH, 2 = yellow sweep
 var int   pendingBar      = na
 
+
 var int   tradeEntryChochBar = na
 var float tpLevel            = na
 var bool  tpTouched          = false
 
 if barstate.isconfirmed
+    // ── Entry setups. A CHoCH rests a LIMIT order at its own candle's POC.
+    // A yellow sweep candle ARMS a level instead: direction from the VWAP,
+    // trigger from a later candle closing beyond that candle's POC.
+    // Only while flat; a newer setup cancels and replaces the older one. ──
+    if strategy.position_size != 0
+        pendingDir := 0
+        pendingTarget := na
+        pendingFrom := 0
+        pendingBar := na
+        sweepArmDir := 0
+        sweepArmPoc := na
+        sweepArmBar := na
+
+    // ── Yellow sweep TRIGGER: one candle closing beyond the armed POC.
+    // A close above the armed POC fires the long, a close below it fires
+    // the short. Entry is at market on the next candle. ──
+    sweepEntryFired = false
+    if enableSweepEntry and sweepArmDir != 0 and strategy.position_size == 0 and not na(sweepArmPoc) and not na(sweepArmBar) and bar_index > sweepArmBar
+        if sweepArmDir == 1 and close > sweepArmPoc
+            strategy.cancel("Long")
+            strategy.cancel("Short")
+            strategy.entry("Long", strategy.long, qty=qty, comment=showTradeText ? "Sweep Long" : "")
+            sweepEntryFired := true
+        else if sweepArmDir == -1 and close < sweepArmPoc
+            strategy.cancel("Long")
+            strategy.cancel("Short")
+            strategy.entry("Short", strategy.short, qty=qty, comment=showTradeText ? "Sweep Short" : "")
+            sweepEntryFired := true
+        if sweepEntryFired
+            sweepArmDir := 0
+            sweepArmPoc := na
+            sweepArmBar := na
+            pendingDir := 0
+            pendingTarget := na
+            pendingFrom := 0
+            pendingBar := na
+
+    // ── Expiry for an armed sweep setup that never got its close ──
+    if sweepExpiryBars > 0 and sweepArmDir != 0 and not na(sweepArmBar) and (bar_index - sweepArmBar) >= sweepExpiryBars
+        sweepArmDir := 0
+        sweepArmPoc := na
+        sweepArmBar := na
+        if pendingFrom == 2
+            pendingDir := 0
+            pendingTarget := na
+            pendingFrom := 0
+            pendingBar := na
+
     n = array.size(iClose)
     if n > 0 and (high - low) > 0 and not na(atrVal)
         rowH   = math.max(syminfo.mintick, atrVal * rowATRMult)
@@ -361,61 +430,58 @@ if barstate.isconfirmed
             lastChochBar   := bar_index
             addChoch(lastSwingLow, chochDownColor)
 
-        // ── Entry setups. Both engines rest a LIMIT order at the trigger
-        // candle's OWN POC — fixed, no walking forward, no bars-to-wait limit
-        // (except the optional sweep expiry). Only while flat; a newer setup
-        // cancels and replaces the older one. CHoCH takes precedence if a
-        // CHoCH and a resolved sweep land on the same candle. ──
-        if strategy.position_size != 0
-            pendingDir := 0
-            pendingTarget := na
-            pendingFrom := 0
-            pendingBar := na
-
         armedThisBar = false
 
-        if enableChochEntry and chochUp and canArmNow and strategy.position_size == 0
+        if enableChochEntry and chochUp and canArmNow and not sweepEntryFired and strategy.position_size == 0
             pendingDir    := 1
             pendingTarget := pocSeries
             pendingFrom   := 1
             pendingBar    := bar_index
             armedThisBar  := true
+            sweepArmDir   := 0
+            sweepArmPoc   := na
+            sweepArmBar   := na
             strategy.cancel("Long")
             strategy.cancel("Short")
             strategy.entry("Long", strategy.long, qty=qty, limit=pendingTarget, comment=showTradeText ? "CHoCH Long" : "")
-        else if enableChochEntry and chochDown and canArmNow and strategy.position_size == 0
+        else if enableChochEntry and chochDown and canArmNow and not sweepEntryFired and strategy.position_size == 0
             pendingDir    := -1
             pendingTarget := pocSeries
             pendingFrom   := 1
             pendingBar    := bar_index
             armedThisBar  := true
+            sweepArmDir   := 0
+            sweepArmPoc   := na
+            sweepArmBar   := na
             strategy.cancel("Long")
             strategy.cancel("Short")
             strategy.entry("Short", strategy.short, qty=qty, limit=pendingTarget, comment=showTradeText ? "CHoCH Short" : "")
 
-        // ── Yellow sweep POC entry: both sides of the prior candle swept,
-        // trade the direction of the SECOND sweep, limit at this candle's POC.
-        // Low swept first then the high -> long. High first then the low -> short. ──
-        if enableSweepEntry and bothResolved and not armedThisBar and canArmNow and strategy.position_size == 0
-            pendingDir    := lastSweepDir
+        // ── Yellow sweep ARM: both sides of the prior candle swept, direction
+        // taken from where the sweep sits relative to the session VWAP —
+        // below the VWAP arms a LONG, above it arms a SHORT — at this
+        // candle's own POC. Nothing is entered until a later candle closes
+        // beyond that POC (handled above, on a following bar). ──
+        int vwapDir = 0
+        if not na(vwapValue)
+            if sweepDirRef == "Whole Candle"
+                vwapDir := high < vwapValue ? 1 : low > vwapValue ? -1 : 0
+            else
+                sweepRef = sweepDirRef == "Candle Close" ? close : pocSeries
+                vwapDir := sweepRef < vwapValue ? 1 : sweepRef > vwapValue ? -1 : 0
+
+        sweepDirOk = vwapDir != 0 and (not requireSweepAgree or (bothResolved and lastSweepDir == vwapDir))
+
+        if enableSweepEntry and bothSwept and sweepDirOk and not armedThisBar and not sweepEntryFired and canArmNow and strategy.position_size == 0
+            strategy.cancel("Long")
+            strategy.cancel("Short")
+            sweepArmDir   := vwapDir
+            sweepArmPoc   := pocSeries
+            sweepArmBar   := bar_index
+            pendingDir    := vwapDir
             pendingTarget := pocSeries
             pendingFrom   := 2
             pendingBar    := bar_index
-            strategy.cancel("Long")
-            strategy.cancel("Short")
-            if lastSweepDir == 1
-                strategy.entry("Long", strategy.long, qty=qty, limit=pendingTarget, comment=showTradeText ? "Sweep Long" : "")
-            else
-                strategy.entry("Short", strategy.short, qty=qty, limit=pendingTarget, comment=showTradeText ? "Sweep Short" : "")
-
-        // ── Optional expiry for an unfilled sweep limit order ──
-        if sweepExpiryBars > 0 and pendingFrom == 2 and strategy.position_size == 0 and not na(pendingBar) and (bar_index - pendingBar) >= sweepExpiryBars
-            strategy.cancel("Long")
-            strategy.cancel("Short")
-            pendingDir := 0
-            pendingTarget := na
-            pendingFrom := 0
-            pendingBar := na
 
         // ── Take profit: exit on the candle AFTER price touches the NEXT CHoCH line ──
         if strategy.position_size != 0 and tpTouched
@@ -437,3 +503,8 @@ if barstate.isconfirmed
             tpTouched := false
             tpLevel := na
             tradeEntryChochBar := na
+
+// ───────────── Armed sweep POC trigger level ─────────────
+// While a yellow sweep setup is waiting for its confirming close, show the
+// exact price a candle has to close beyond to fire the entry.
+plot(showArmedLevel and sweepArmDir != 0 ? sweepArmPoc : na, title="Armed Sweep POC", color=armedLevelColor, style=plot.style_linebr, linewidth=2)

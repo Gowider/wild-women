@@ -41,7 +41,7 @@ p3 = input.int(11,   "ST 3  ATR",        minval = 1,   inline = "st3", group = G
 m3 = input.float(2.0, "  x",             step   = 0.1, inline = "st3", group = G_ST)
 
 // ---------------------------------------------------------------------------
-// Inputs — SMA entry filter
+// Inputs — SMA filters
 // ---------------------------------------------------------------------------
 var string G_SMA = "SMA filters"
 smaSrc = input.source(close, "SMA source", group = G_SMA)
@@ -217,7 +217,7 @@ inConfirmWin   = alignDir != 0 and barsSinceAlign <= confirmBars
 agreeNow  = alignDir != 0 and alignDir != nz(alignDir[1])
 
 // the first bar inside that one-hour window where price closes on the correct
-// side of the 49 SMA — the confirmation the entry waits for
+// side of every gating SMA — the confirmation the entry waits for
 smaAgrees  = alignDir == 1 ? smaLongOk : alignDir == -1 ? smaShortOk : false
 confirmNow = inConfirmWin and smaAgrees and not confDone
 if confirmNow
@@ -399,7 +399,7 @@ if showTbl and barstate.islast
 // ---------------------------------------------------------------------------
 alertcondition(longSignal,  "Long entry",  "3xST + SMA49: long entry")
 alertcondition(shortSignal, "Short entry", "3xST + SMA49: short entry")
-alertcondition(flipLong or flipShort, "Supertrend flip exit", "3xST + SMA49: a Supertrend changed colour — exit")
+alertcondition(flipLong or flipShort, "Supertrend flip exit", "3xST + SMA49: enough Supertrends turned against the trade — exit")
 alertcondition(eodHit, "EOD exit", "3xST + SMA49: hard EOD exit")
 alertcondition(agreeNow,   "Supertrend agreement", "3xST + SMA49: all three Supertrends agree")
-alertcondition(confirmNow, "SMA confirmation",     "3xST + SMA49: 49 SMA confirmed the trend direction")
+alertcondition(confirmNow, "SMA confirmation",     "3xST + SMA49: the SMA gate confirmed the trend direction")

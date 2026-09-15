@@ -1,6 +1,6 @@
 # Triple Supertrend + SMA filters — session-window strategy
 
-`triple_supertrend_sma49.pine` — Pine Script v5, built for a 5-minute chart.
+`Triple-Supertrend-49-SMA.pine` — Pine Script v5, built for a 5-minute chart.
 Paste it into TradingView's Pine Editor and **Add to chart**.
 
 ## Entry

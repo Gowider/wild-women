@@ -175,3 +175,79 @@ Applied cumulatively to this dataset:
 - **The what-if figures assume the breakeven stop would not have taken winners
   out early.** On this data no winner retraced through its entry after reaching
   1R, but on other data some will. Treat +$19,425 as an upper bound.
+
+---
+
+# Addendum — the 16 long trades, and a correction
+
+## Correction: the windows were working
+
+The earlier claim that the window filter was not being enforced was wrong. This
+run used **a single window, 19:30–15:30**, not the four windows in the script's
+defaults. All 90 trades fall inside 19:30–15:30 — zero exceptions. The filter
+was doing exactly what it was told.
+
+## The 16 trades that held 17+ bars
+
++$43,675 on 18% of the trades. 11 winners, 5 losers.
+
+| # | Entry | Exit | Dir | Bars | Exit reason | MFE | MAE | P&L |
+|---|---|---|---|---|---|---|---|---|
+| 2 | Mon 08-17 07:45 | Mon 15:15 | S | 30 | EOD | 4,125 | -175 | **+4,125** |
+| 3 | Mon 08-17 21:15 | Tue 15:15 | S | 72 | EOD | 5,275 | -100 | **+4,550** |
+| 5 | Wed 08-19 02:45 | Wed 15:15 | L | 50 | EOD | 5,050 | -500 | **+2,150** |
+| 8 | Thu 08-20 03:00 | Thu 15:15 | S | 49 | EOD | 6,725 | -75 | **+6,325** |
+| 11 | Fri 08-21 03:00 | Fri 15:15 | L | 49 | EOD | 3,600 | -200 | **+1,775** |
+| 14 | Sun 08-23 23:30 | Mon 15:15 | S | 63 | EOD | 3,000 | -200 | **+1,075** |
+| 16 | Mon 08-24 23:00 | Tue 10:30 | L | 46 | L stop | 3,925 | -500 | -500 |
+| 45 | Mon 08-31 02:15 | Mon 07:30 | L | 21 | L stop | 650 | -500 | -500 |
+| 51 | Tue 09-01 03:45 | Tue 15:15 | S | 46 | EOD | 6,900 | -250 | **+4,950** |
+| 56 | Wed 09-02 09:15 | Wed 15:15 | L | 24 | EOD | 4,100 | -700 | **+3,075** |
+| 60 | Thu 09-03 08:30 | Thu 15:15 | L | 27 | EOD | 7,550 | -50 | **+6,900** |
+| 61 | Thu 09-03 20:45 | Fri 08:00 | L | 45 | L stop | 800 | -500 | -500 |
+| 72 | Tue 09-08 01:30 | Tue 06:15 | S | 19 | S stop | 2,200 | -500 | -500 |
+| 80 | Thu 09-10 04:30 | Thu 15:15 | S | 43 | EOD | 6,775 | -350 | **+5,725** |
+| 82 | Fri 09-11 00:30 | Fri 15:15 | L | 59 | EOD | 7,075 | -175 | **+5,525** |
+| 85 | Mon 09-14 02:30 | Mon 09:45 | S | 29 | S stop | 2,150 | -500 | -500 |
+
+## What the 11 winners share
+
+- **Every single one exited at EOD.** Not one was taken out by a stop or a flip.
+- **9 of 11 entered between 00:30 and 09:15.** The other two were 21:15 and 23:30.
+- **Direction is balanced** — 6 short, 5 long. This is not the downtrend talking.
+- **Median hold 12.2 hours**, median MFE $5,275.
+- **Median MAE -$200 — eight ticks.** They worked almost straight away.
+
+Entry clock is the one clean, non-circular split in the data:
+
+| Entry time | Trades | Net | Win% |
+|---|---|---|---|
+| 00:00–09:59 | 50 | **+$18,050** | 18% |
+| all other hours | 40 | **-$11,550** | 10% |
+
+## The MAE tell
+
+| Worst drawdown reached | Trades | Win% | Net |
+|---|---|---|---|
+| never worse than -$375 (15 ticks) | 10 | **100%** | +$41,350 |
+| worse than -$375 | 80 | 4% | -$34,850 |
+
+Every trade that never went 15 ticks against you won. Read this carefully: it is
+*partly* circular, because a trade that runs in your favour never records a deep
+drawdown. It is not an entry filter. What it does say is that **this setup works
+immediately when it works at all** — a trade sitting 15+ ticks underwater has a
+4% chance of coming good, so there is nothing to be gained by giving it room.
+
+Tightening the stop from 20 to 15 ticks on this sample saves ~$10,000 across 80
+losers but kills 3 winners worth ~$6,750. Net gain roughly +$2,000 — too thin to
+act on from one month.
+
+**Caveat:** the numbers above come from the 15-minute export. They are not the
+5-minute run showing +$11k and 2.15 PF. Send that trade list and this analysis
+should be redone against it.
+
+**One thing to verify:** trades 5, 56 and one other record an MAE deeper than the
+$500 stop yet survived to a profit. That should not happen if the stop were live
+on every bar. The likely cause is that `strategy.exit` only arms on the bar after
+the fill, so the entry bar itself is unprotected. Worth confirming, because
+fixing it would turn two of the sixteen winners into losers.

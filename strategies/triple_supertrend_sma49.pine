@@ -8,7 +8,7 @@
 //               moment the three Supertrends first lined up
 //           AND the bar falls inside one of the four trading windows.
 // Stop    : 20 ticks from fill (each window carries its own tick setting).
-// Exit    : any one of the three Supertrends changes colour
+// Exit    : two of the three Supertrends turn against the trade (adjustable)
 //           / stop loss
 //           / hard end-of-day exit at 15:30
 //           / optional hard time exit at the end of each window.
@@ -72,7 +72,11 @@ oneShot    = input.bool(true,    "Only one entry per alignment",
 // Inputs — trading windows
 // ---------------------------------------------------------------------------
 var string G_W = "Trading windows (HHMM)"
-tzMode = input.string("Exchange", "Timezone", group = G_W,
+// The window times are read in THIS timezone, which has nothing to do with the
+// timezone your chart displays. "Exchange" on a CME symbol means Chicago, so on
+// an Eastern-time chart every window looks an hour early. Set this to the zone
+// your window times are quoted in and check the status table.
+tzMode = input.string("America/New_York", "Window timezone", group = G_W,
      options = ["Exchange", "America/New_York", "America/Chicago", "America/Los_Angeles", "Europe/London", "Europe/Berlin", "Asia/Tokyo", "Asia/Shanghai", "UTC"])
 
 w1on = input.bool(true, "1", inline = "w1", group = G_W)
@@ -97,7 +101,9 @@ sl1 = input.float(20, "Window 1 stop (ticks)", minval = 1, step = 1, group = G_R
 sl2 = input.float(20, "Window 2 stop (ticks)", minval = 1, step = 1, group = G_R)
 sl3 = input.float(20, "Window 3 stop (ticks)", minval = 1, step = 1, group = G_R)
 sl4 = input.float(20, "Window 4 stop (ticks)", minval = 1, step = 1, group = G_R)
-exitOnFlip  = input.bool(true, "Exit when any one Supertrend changes colour", group = G_R)
+exitOnFlip  = input.bool(true, "Exit on Supertrend flips", inline = "flip", group = G_R)
+flipsToExit = input.int(2, "how many", minval = 1, maxval = 3, inline = "flip", group = G_R,
+     tooltip = "How many of the three Supertrends have to turn against the trade before it is closed. 1 = the original rule, 2 = give the trade room to survive a single flip.")
 useWinClose = input.bool(false, "Force flat at the end of the entry window",
      tooltip = "Off by default: trades are allowed to run past the window that opened them, up to the EOD time below.", group = G_R)
 eodOn = input.bool(true, "Hard EOD exit", inline = "eod", group = G_R)
@@ -111,6 +117,16 @@ showAgreeLbl = input.bool(true, "Label 3-Supertrend agreement (Buy / Sell)", gro
 showConfLbl  = input.bool(true, "Label the SMA confirmation (Confirmed)",
      tooltip = "Only drawn when at least one SMA is set as a gate — with no gate there is nothing to confirm.", group = G_L)
 lblSize      = input.string("Small", "Label size", options = ["Tiny", "Small", "Normal", "Large"], group = G_L)
+lblInWinOnly = input.bool(true, "Only label inside the trading windows",
+     tooltip = "On by default so the labels match the rules. Turn it off to see every agreement and confirmation, including the ones no trade can be taken on.", group = G_L)
+
+// ---------------------------------------------------------------------------
+// Inputs — status table
+// ---------------------------------------------------------------------------
+var string G_T = "Status table"
+showTbl = input.bool(true, "Show status table", group = G_T)
+tblPos  = input.string("Top right", "Corner",
+     options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = G_T)
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -268,8 +284,12 @@ if strategy.position_size > 0
 if strategy.position_size < 0
     strategy.exit("S stop", from_entry = "Short", stop = strategy.position_avg_price + slDist)
 
-flipLong  = exitOnFlip and strategy.position_size > 0 and not allLong
-flipShort = exitOnFlip and strategy.position_size < 0 and not allShort
+// how many of the three now point against an open trade
+againstLong  = (t1 != 1 ? 1 : 0) + (t2 != 1 ? 1 : 0) + (t3 != 1 ? 1 : 0)
+againstShort = (t1 != -1 ? 1 : 0) + (t2 != -1 ? 1 : 0) + (t3 != -1 ? 1 : 0)
+
+flipLong  = exitOnFlip and strategy.position_size > 0 and againstLong  >= flipsToExit
+flipShort = exitOnFlip and strategy.position_size < 0 and againstShort >= flipsToExit
 
 if flipLong
     strategy.close("Long", comment = "ST flip")
@@ -304,7 +324,7 @@ lblOffs = nz(ta.atr(14), syminfo.mintick * 10)
 confY   = alignDir == 1 ? low  - (agreeNow ? 1.6 : 0.6) * lblOffs
      :                    high + (agreeNow ? 1.6 : 0.6) * lblOffs
 
-if showAgreeLbl and agreeNow
+if showAgreeLbl and agreeNow and (inAnyWin or not lblInWinOnly)
     label.new(bar_index, alignDir == 1 ? low : high,
          text      = alignDir == 1 ? "Buy" : "Sell",
          style     = alignDir == 1 ? label.style_label_up : label.style_label_down,
@@ -312,7 +332,7 @@ if showAgreeLbl and agreeNow
          color     = alignDir == 1 ? color.new(color.green, 0) : color.new(color.red, 0),
          textcolor = color.white, size = lblSizeVal)
 
-if showConfLbl and confirmNow and anyGate
+if showConfLbl and confirmNow and anyGate and (inAnyWin or not lblInWinOnly)
     label.new(bar_index, confY,
          text      = "Confirmed",
          style     = alignDir == 1 ? label.style_label_up : label.style_label_down,
@@ -322,6 +342,57 @@ if showConfLbl and confirmNow and anyGate
 
 plotshape(longSignal,  "Long entry",  location = location.belowbar, style = shape.triangleup,   size = size.tiny, color = color.new(color.green, 0))
 plotshape(shortSignal, "Short entry", location = location.abovebar, style = shape.triangledown, size = size.tiny, color = color.new(color.red, 0))
+
+// ---------------------------------------------------------------------------
+// Status table — what the script thinks the clock, the windows and the book
+// are doing right now. If the windows look wrong on your chart, read the
+// "Script clock" row: it is the time the rules are actually being applied at.
+// ---------------------------------------------------------------------------
+f_tblPos(x) =>
+    x == "Top left"      ? position.top_left    :
+     x == "Bottom right" ? position.bottom_right :
+     x == "Bottom left"  ? position.bottom_left  :
+     x == "Middle right" ? position.middle_right : position.top_right
+
+var table infoT = table.new(f_tblPos(tblPos), 2, 8, border_width = 1,
+     frame_color = color.new(color.gray, 50), frame_width = 1)
+
+f_row(r, k, v, vc) =>
+    table.cell(infoT, 0, r, k, text_color = color.new(color.gray, 20), text_size = size.small, text_halign = text.align_left)
+    table.cell(infoT, 1, r, v, text_color = vc, text_size = size.small, text_halign = text.align_right)
+
+if showTbl and barstate.islast
+    table.clear(infoT, 0, 0, 1, 7)
+
+    stText = (t1 == 1 ? "▲" : "▼") + (t2 == 1 ? "▲" : "▼") + (t3 == 1 ? "▲" : "▼")
+    stCol  = allLong ? color.green : allShort ? color.red : color.gray
+
+    winText = activeWin == 1 ? "1 · " + w1s + "-" + w1e :
+         activeWin == 2 ? "2 · " + w2s + "-" + w2e :
+         activeWin == 3 ? "3 · " + w3s + "-" + w3e :
+         activeWin == 4 ? "4 · " + w4s + "-" + w4e : "closed"
+
+    gateText = not anyGate ? "no gate set" :
+         alignDir == 0     ? "—" :
+         smaAgrees         ? "confirmed" :
+         inConfirmWin      ? "waiting · " + str.tostring(confirmBars - barsSinceAlign) + " bars left" :
+         "expired"
+
+    posText = strategy.position_size == 0 ? "flat" :
+         (strategy.position_size > 0 ? "long " : "short ") +
+         str.tostring(math.abs(strategy.position_size), "#.##") + " @ " +
+         str.tostring(strategy.position_avg_price, format.mintick)
+
+    f_row(0, "Window timezone", tz, color.new(color.gray, 0))
+    f_row(1, "Script clock",    str.format_time(time_close, "yyyy-MM-dd HH:mm", tz), color.new(color.gray, 0))
+    f_row(2, "Window",          winText, activeWin == 0 ? color.new(color.gray, 30) : color.new(color.aqua, 0))
+    f_row(3, "Supertrends",     stText,  stCol)
+    f_row(4, "SMA gate",        gateText, smaAgrees and anyGate ? color.green : color.new(color.gray, 20))
+    f_row(5, "Position",        posText, strategy.position_size == 0 ? color.new(color.gray, 30) : strategy.position_size > 0 ? color.green : color.red)
+    f_row(6, "Stop in force",   str.tostring(slTicks, "#") + " ticks (" + str.tostring(slDist, format.mintick) + ")", color.new(color.gray, 0))
+    f_row(7, "Net P&L · trades",
+         str.tostring(strategy.netprofit, "#.##") + " · " + str.tostring(strategy.closedtrades),
+         strategy.netprofit > 0 ? color.green : strategy.netprofit < 0 ? color.red : color.new(color.gray, 20))
 
 // ---------------------------------------------------------------------------
 // Alerts

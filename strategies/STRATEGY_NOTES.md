@@ -41,6 +41,10 @@ Three independent SMAs, each with its own row of inputs: **on/off**, **length**,
   the 49 and the 200 — a much tighter filter, and worth backtesting before you
   commit to it.
 
+Labels only print inside the trading windows by default, so what you see on the
+chart matches what the strategy can actually trade. `Only label inside the
+trading windows` turns that off if you want to see every agreement.
+
 `Only one entry per alignment` (on by default) stops the strategy re-entering
 the same setup after a stop-out. Turn it off if you want it to keep trying while
 the three stay aligned and the hour is still running.
@@ -54,17 +58,30 @@ the three stay aligned and the hour is still running.
 | 3 | 10:30 – 11:30 | |
 | 4 | 14:00 – 14:45 | |
 
-Times are read in the **chart/exchange timezone** by default. The `Timezone`
-input overrides that if your windows are quoted in a different zone — set it
-before you judge any backtest.
+### Timezone — read this before you judge a backtest
+
+`Window timezone` decides what clock the window times are read on, and it has
+**nothing to do with the timezone your chart displays**. The two being different
+is the single most common reason windows look wrong.
+
+`Exchange` on a CME symbol means `America/Chicago`. On an Eastern-time chart
+that puts every window an hour away from where you expect it: a 21:45 window
+opens at 22:45 on the chart. The default is therefore `America/New_York`.
+
+The **status table** in the top-right corner settles it — the `Script clock` row
+is the time the rules are actually being applied at, and the `Window` row names
+the window it thinks is open. If the clock row disagrees with the time axis,
+that difference is your bug.
 
 ## Exits
 
 - **Stop loss** — 20 ticks from the fill. Each window has its own tick input
   (`Window 1 stop` … `Window 4 stop`), all defaulted to 20, and the stop used is
   the one belonging to the window the trade was opened in.
-- **Supertrend flip** — the moment any one of the three changes colour against
-  the position, the trade is closed at that bar's close.
+- **Supertrend flip** — the trade is closed at the bar's close once
+  `how many` of the three have turned against it. Default **2**, so a single
+  Supertrend flipping no longer takes the trade off; set it to 1 for the
+  original one-flip rule, or 3 to hold until all three have reversed.
 - **Hard EOD exit at 15:30** — flat, no questions.
 - **Window close (off by default)** — `Force flat at the end of the entry window`
   also kicks the trade out at the end of the window that opened it.
@@ -81,6 +98,17 @@ in the script:
   switch, off by default.
 
 Flip the switch if the second reading is what you meant.
+
+## Status table
+
+Top-right corner, switchable off. It reports the window timezone in force, the
+script clock, the open window, the three Supertrend directions, the state of the
+SMA gate (confirmed / waiting with bars left / expired), the open position, the
+stop in force, and Pine's own running net P&L and closed-trade count.
+
+That last row is a cross-check: it is read straight from `strategy.netprofit`
+and `strategy.closedtrades`. If it disagrees with the Strategy Tester panel, the
+panel is stale — reload the script.
 
 ## Backtest settings that matter
 

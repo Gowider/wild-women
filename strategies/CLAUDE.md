@@ -13,6 +13,10 @@ strategies/
 Create the folder first, then add the `.pine` and the `.md` into it. One
 strategy per folder — never drop a loose `.pine` at the top of `strategies/`.
 
+Backtest analyses live in the same folder, named
+`<Strategy-Name>-analysis-YYYY-MM-DD.md` after the date of the exported trade
+list, so successive runs sit side by side instead of overwriting each other.
+
 Use hyphens rather than spaces in folder and file names so the paths stay easy
 to work with from a shell and in URLs.
 

@@ -19,17 +19,19 @@ Paste it into TradingView's Pine Editor and **Add to chart**.
 4. **A trading window is open.** Entries only fire inside one of the four
    windows; the shaded background shows them.
 
-## SMA slots
+## Moving average slots
 
-Three independent SMAs, each with its own row of inputs: **on/off**, **length**,
-**gate**, **colour**.
+Three independent averages, each with its own row of inputs: **on/off**,
+**SMA or EMA**, **length**, **gate**, **colour**.
 
 | Slot | Default | Gate | Role |
 |------|---------|------|------|
-| SMA 1 | 49  | yes | the entry signal — price has to close on its trend side |
-| SMA 2 | 200 | no  | plotted for context; tick `gate` to make it a second filter |
-| SMA 3 | 20  | —   | off, a spare slot |
+| MA 1 | SMA 60  | yes | the entry signal — price has to close on its trend side |
+| MA 2 | SMA 200 | no  | plotted for context; tick `gate` to make it a second filter |
+| MA 3 | EMA 20  | —   | off, a spare slot |
 
+- **SMA / EMA** picks the average type for that slot. Both are computed every
+  bar and one is selected, so switching type never disturbs the other's state.
 - **on/off** controls whether the line is drawn.
 - **gate** controls whether it has a say in entries. A slot only gates when it
   is both on *and* gated, so switching a slot off also removes it from the entry
@@ -37,8 +39,8 @@ Three independent SMAs, each with its own row of inputs: **on/off**, **length**,
 - With **no** slot gating, there is nothing to confirm: entries fire as soon as
   the three Supertrends agree inside a window, and the Confirmed label is
   suppressed.
-- Turning on SMA 2's gate makes the setup need price on the right side of both
-  the 49 and the 200 — a much tighter filter, and worth backtesting before you
+- Turning on MA 2's gate makes the setup need price on the right side of both
+  the 60 and the 200 — a much tighter filter, and worth backtesting before you
   commit to it.
 
 Labels only print inside the trading windows by default, so what you see on the
@@ -67,6 +69,15 @@ is the single most common reason windows look wrong.
 `Exchange` on a CME symbol means `America/Chicago`. On an Eastern-time chart
 that puts every window an hour away from where you expect it: a 21:45 window
 opens at 22:45 on the chart. The default is therefore `America/New_York`.
+
+If the windows still land an hour out after picking a zone — which happens when
+your chart is on one clock and your window times were written on another — use
+**`Manual offset (hours)`**. It nudges every window time and the EOD time
+together: `-1` moves them an hour earlier, `+1` an hour later. The offset shows
+in the status table next to the clock so you can see it is applied.
+
+Window membership is judged on each bar's **open**; the EOD and window-end exits
+fire on the bar that **closes** at the given time.
 
 The **status table** in the top-right corner settles it — the `Script clock` row
 is the time the rules are actually being applied at, and the `Window` row names

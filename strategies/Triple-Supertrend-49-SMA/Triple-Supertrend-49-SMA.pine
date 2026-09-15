@@ -43,27 +43,30 @@ m3 = input.float(2.0, "  x",             step   = 0.1, inline = "st3", group = G
 // ---------------------------------------------------------------------------
 // Inputs — SMA filters
 // ---------------------------------------------------------------------------
-var string G_SMA = "SMA filters"
-smaSrc = input.source(close, "SMA source", group = G_SMA)
+var string G_SMA = "Moving average filters"
+smaSrc = input.source(close, "Source", group = G_SMA)
 
-// Three SMA slots. "On" plots the average; "Gate" makes price have to close on
-// the trend side of it before an entry is allowed. A slot that is off, or on
-// but not gating, has no say in the entry.
-ma1On   = input.bool(true,  "SMA 1", inline = "ma1", group = G_SMA)
-ma1Len  = input.int(49,     "len",   inline = "ma1", minval = 1, group = G_SMA)
-ma1Gate = input.bool(true,  "gate",  inline = "ma1", group = G_SMA)
+// Three MA slots. Each picks SMA or EMA, a length, and two switches: "on" plots
+// it, "gate" makes price have to close on the trend side of it before an entry
+// is allowed. A slot that is off, or on but not gating, has no say in entries.
+ma1On   = input.bool(true,  "MA 1", inline = "ma1", group = G_SMA)
+ma1Type = input.string("SMA", "", options = ["SMA", "EMA"], inline = "ma1", group = G_SMA)
+ma1Len  = input.int(60,     "len",  inline = "ma1", minval = 1, group = G_SMA)
+ma1Gate = input.bool(true,  "gate", inline = "ma1", group = G_SMA)
 ma1Col  = input.color(color.orange, "", inline = "ma1", group = G_SMA)
 
-ma2On   = input.bool(true,  "SMA 2", inline = "ma2", group = G_SMA)
-ma2Len  = input.int(200,    "len",   inline = "ma2", minval = 1, group = G_SMA)
-ma2Gate = input.bool(false, "gate",  inline = "ma2", group = G_SMA)
+ma2On   = input.bool(true,  "MA 2", inline = "ma2", group = G_SMA)
+ma2Type = input.string("SMA", "", options = ["SMA", "EMA"], inline = "ma2", group = G_SMA)
+ma2Len  = input.int(200,    "len",  inline = "ma2", minval = 1, group = G_SMA)
+ma2Gate = input.bool(false, "gate", inline = "ma2", group = G_SMA)
 ma2Col  = input.color(color.blue,   "", inline = "ma2", group = G_SMA)
 
-ma3On   = input.bool(false, "SMA 3", inline = "ma3", group = G_SMA)
-ma3Len  = input.int(20,     "len",   inline = "ma3", minval = 1, group = G_SMA)
-ma3Gate = input.bool(false, "gate",  inline = "ma3", group = G_SMA)
+ma3On   = input.bool(false, "MA 3", inline = "ma3", group = G_SMA)
+ma3Type = input.string("EMA", "", options = ["SMA", "EMA"], inline = "ma3", group = G_SMA)
+ma3Len  = input.int(20,     "len",  inline = "ma3", minval = 1, group = G_SMA)
+ma3Gate = input.bool(false, "gate", inline = "ma3", group = G_SMA)
 ma3Col  = input.color(color.purple, "", inline = "ma3", group = G_SMA)
-confirmMin = input.int(60,       "Minutes allowed for the SMA to confirm",
+confirmMin = input.int(60,       "Minutes allowed for the MA to confirm",
      minval = 0, tooltip = "After the three Supertrends line up, price has this long to close on the correct side of every gating SMA. 0 = they must already agree on the alignment bar.", group = G_SMA)
 oneShot    = input.bool(true,    "Only one entry per alignment",
      tooltip = "Blocks a re-entry after a stop-out until the Supertrends line up again from scratch.", group = G_SMA)
@@ -78,6 +81,8 @@ var string G_W = "Trading windows (HHMM)"
 // your window times are quoted in and check the status table.
 tzMode = input.string("America/New_York", "Window timezone", group = G_W,
      options = ["Exchange", "America/New_York", "America/Chicago", "America/Los_Angeles", "Europe/London", "Europe/Berlin", "Asia/Tokyo", "Asia/Shanghai", "UTC"])
+tzShift = input.float(0, "Manual offset (hours)", step = 0.25, minval = -12, maxval = 12, group = G_W,
+     tooltip = "Nudge every window time and the EOD time by this many hours. Use it when the windows land an hour out from where you want them: check the Script clock row in the status table against your chart's time axis and set the difference here. -1 moves the windows an hour earlier.")
 
 w1on = input.bool(true, "1", inline = "w1", group = G_W)
 w1s  = input.string("2145", "", inline = "w1", group = G_W)
@@ -114,8 +119,8 @@ eodT  = input.string("1530", "",          inline = "eod", group = G_R)
 // ---------------------------------------------------------------------------
 var string G_L = "Labels"
 showAgreeLbl = input.bool(true, "Label 3-Supertrend agreement (Buy / Sell)", group = G_L)
-showConfLbl  = input.bool(true, "Label the SMA confirmation (Confirmed)",
-     tooltip = "Only drawn when at least one SMA is set as a gate — with no gate there is nothing to confirm.", group = G_L)
+showConfLbl  = input.bool(true, "Label the MA confirmation (Confirmed)",
+     tooltip = "Only drawn when at least one MA is set as a gate — with no gate there is nothing to confirm.", group = G_L)
 lblSize      = input.string("Small", "Label size", options = ["Tiny", "Small", "Normal", "Large"], group = G_L)
 lblInWinOnly = input.bool(true, "Only label inside the trading windows",
      tooltip = "On by default so the labels match the rules. Turn it off to see every agreement and confirmation, including the ones no trade can be taken on.", group = G_L)
@@ -133,21 +138,23 @@ tblPos  = input.string("Top right", "Corner",
 // ---------------------------------------------------------------------------
 tz = tzMode == "Exchange" ? syminfo.timezone : tzMode
 
-// "1430" -> 14 / 30
-f_hh(s) => int(nz(str.tonumber(str.substring(s, 0, 2)), 0))
-f_mm(s) => int(nz(str.tonumber(str.substring(s, 2, 4)), 0))
+// "1430" -> 870, its minute of the day
+f_min(s) => int(nz(str.tonumber(str.substring(s, 0, 2)), 0)) * 60 +
+     int(nz(str.tonumber(str.substring(s, 2, 4)), 0))
 
-// true on the bar that closes at (or first closes past) HH:MM in `tz`
-f_hit(hh, mm) =>
-    t = timestamp(tz, year(time, tz), month(time, tz), dayofmonth(time, tz), hh, mm, 0)
-    time_close >= t and time_close[1] < t
+offMin = math.round(tzShift * 60)
+f_wrap(x) => int(((x % 1440) + 1440) % 1440)
 
-// session strings for the four windows (":1234567" = every day, so an
-// overnight window such as 2145-0445 rolls across midnight correctly)
-sess1 = w1s + "-" + w1e + ":1234567"
-sess2 = w2s + "-" + w2e + ":1234567"
-sess3 = w3s + "-" + w3e + ":1234567"
-sess4 = w4s + "-" + w4e + ":1234567"
+// the script's own clock: minute of the day in `tz`, nudged by the manual
+// offset. Windows are judged on the bar's open, time exits on its close.
+mOpen  = f_wrap(hour(time,       tz) * 60 + minute(time,       tz) + offMin)
+mClose = f_wrap(hour(time_close, tz) * 60 + minute(time_close, tz) + offMin)
+
+// inside a window? handles a window that rolls across midnight (start > end)
+f_in(on, sm, em) => on and (sm < em ? (mOpen >= sm and mOpen < em) : (mOpen >= sm or mOpen < em))
+
+// true on the bar that closes at, or first closes past, that minute of the day
+f_hit(m) => mClose >= m and mClose[1] < m
 
 // Supertrend — straight port of the v4 study
 f_st(src, periods, mult) =>
@@ -171,9 +178,16 @@ f_st(src, periods, mult) =>
 [t2, up2v, dn2v] = f_st(stSrc, p2, m2)
 [t3, up3v, dn3v] = f_st(stSrc, p3, m3)
 
-ma1 = ta.sma(smaSrc, ma1Len)
-ma2 = ta.sma(smaSrc, ma2Len)
-ma3 = ta.sma(smaSrc, ma3Len)
+// both averages are computed every bar and then selected — calling ta.sma or
+// ta.ema inside a ternary would starve whichever one is not picked
+f_ma(src, len, typ) =>
+    float sm = ta.sma(src, len)
+    float em = ta.ema(src, len)
+    typ == "EMA" ? em : sm
+
+ma1 = f_ma(smaSrc, ma1Len, ma1Type)
+ma2 = f_ma(smaSrc, ma2Len, ma2Type)
+ma3 = f_ma(smaSrc, ma3Len, ma3Type)
 
 // a slot only gates when it is both switched on and marked as a gate
 g1 = ma1On and ma1Gate
@@ -226,10 +240,10 @@ if confirmNow
 // ---------------------------------------------------------------------------
 // Trading windows
 // ---------------------------------------------------------------------------
-inW1 = w1on and not na(time(timeframe.period, sess1, tz))
-inW2 = w2on and not na(time(timeframe.period, sess2, tz))
-inW3 = w3on and not na(time(timeframe.period, sess3, tz))
-inW4 = w4on and not na(time(timeframe.period, sess4, tz))
+inW1 = f_in(w1on, f_min(w1s), f_min(w1e))
+inW2 = f_in(w2on, f_min(w2s), f_min(w2e))
+inW3 = f_in(w3on, f_min(w3s), f_min(w3e))
+inW4 = f_in(w4on, f_min(w4s), f_min(w4e))
 
 activeWin = inW1 ? 1 : inW2 ? 2 : inW3 ? 3 : inW4 ? 4 : 0
 inAnyWin  = activeWin != 0
@@ -237,16 +251,16 @@ inAnyWin  = activeWin != 0
 // ---------------------------------------------------------------------------
 // Hard time exits
 // ---------------------------------------------------------------------------
-eodRaw = f_hit(f_hh(eodT), f_mm(eodT))
+eodRaw = f_hit(f_min(eodT))
 eodHit = eodOn and eodRaw
 
 // every window end is evaluated on every bar (Pine keeps function history
 // consistent only when the call is unconditional), then the one belonging to
 // the open trade is selected.
-w1End = f_hit(f_hh(w1e), f_mm(w1e))
-w2End = f_hit(f_hh(w2e), f_mm(w2e))
-w3End = f_hit(f_hh(w3e), f_mm(w3e))
-w4End = f_hit(f_hh(w4e), f_mm(w4e))
+w1End = f_hit(f_min(w1e))
+w2End = f_hit(f_min(w2e))
+w3End = f_hit(f_min(w3e))
+w4End = f_hit(f_min(w4e))
 
 // ---------------------------------------------------------------------------
 // Entries
@@ -309,9 +323,9 @@ plot(t2 == -1 ? dn2v : na, "ST2 down", color = color.new(color.red,   40), style
 plot(t3 ==  1 ? up3v : na, "ST3 up",   color = color.new(color.green, 40), style = plot.style_linebr, linewidth = 1)
 plot(t3 == -1 ? dn3v : na, "ST3 down", color = color.new(color.red,   40), style = plot.style_linebr, linewidth = 1)
 
-plot(ma1On ? ma1 : na, "SMA 1", color = ma1Col, linewidth = 2)
-plot(ma2On ? ma2 : na, "SMA 2", color = ma2Col, linewidth = 2)
-plot(ma3On ? ma3 : na, "SMA 3", color = ma3Col, linewidth = 2)
+plot(ma1On ? ma1 : na, "MA 1", color = ma1Col, linewidth = 2)
+plot(ma2On ? ma2 : na, "MA 2", color = ma2Col, linewidth = 2)
+plot(ma3On ? ma3 : na, "MA 3", color = ma3Col, linewidth = 2)
 
 bgcolor(shadeWin and inAnyWin ? color.new(color.blue, 92) : na, title = "Trading window")
 bgcolor(allLong ? color.new(color.green, 88) : allShort ? color.new(color.red, 88) : na, title = "Supertrend agreement")
@@ -384,10 +398,13 @@ if showTbl and barstate.islast
          str.tostring(strategy.position_avg_price, format.mintick)
 
     f_row(0, "Window timezone", tz, color.new(color.gray, 0))
-    f_row(1, "Script clock",    str.format_time(time_close, "yyyy-MM-dd HH:mm", tz), color.new(color.gray, 0))
+    f_row(1, "Script clock",
+         str.format_time(time_close + offMin * 60000, "yyyy-MM-dd HH:mm", tz) +
+         (offMin == 0 ? "" : " (" + (offMin > 0 ? "+" : "") + str.tostring(tzShift, "#.##") + "h)"),
+         offMin == 0 ? color.new(color.gray, 0) : color.new(color.aqua, 0))
     f_row(2, "Window",          winText, activeWin == 0 ? color.new(color.gray, 30) : color.new(color.aqua, 0))
     f_row(3, "Supertrends",     stText,  stCol)
-    f_row(4, "SMA gate",        gateText, smaAgrees and anyGate ? color.green : color.new(color.gray, 20))
+    f_row(4, "MA gate",         gateText, smaAgrees and anyGate ? color.green : color.new(color.gray, 20))
     f_row(5, "Position",        posText, strategy.position_size == 0 ? color.new(color.gray, 30) : strategy.position_size > 0 ? color.green : color.red)
     f_row(6, "Stop in force",   str.tostring(slTicks, "#") + " ticks (" + str.tostring(slDist, format.mintick) + ")", color.new(color.gray, 0))
     f_row(7, "Net P&L · trades",

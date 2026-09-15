@@ -1,9 +1,9 @@
 //@version=5
 // =============================================================================
-// Triple Supertrend + 49 SMA  —  session-window intraday strategy
+// Triple Supertrend + SMA filters  —  session-window intraday strategy
 //
 // Entry   : all three Supertrends (12/3, 10/1, 11/2) agree on direction
-//           AND price closes on the correct side of the 49 SMA
+//           AND price closes on the correct side of every gating SMA
 //           AND that SMA confirmation happens within 60 minutes of the
 //               moment the three Supertrends first lined up
 //           AND the bar falls inside one of the four trading windows.
@@ -43,11 +43,28 @@ m3 = input.float(2.0, "  x",             step   = 0.1, inline = "st3", group = G
 // ---------------------------------------------------------------------------
 // Inputs — SMA entry filter
 // ---------------------------------------------------------------------------
-var string G_SMA = "49 SMA entry filter"
-smaSrc     = input.source(close, "SMA source",                              group = G_SMA)
-smaLen     = input.int(49,       "SMA length",             minval = 1,      group = G_SMA)
+var string G_SMA = "SMA filters"
+smaSrc = input.source(close, "SMA source", group = G_SMA)
+
+// Three SMA slots. "On" plots the average; "Gate" makes price have to close on
+// the trend side of it before an entry is allowed. A slot that is off, or on
+// but not gating, has no say in the entry.
+ma1On   = input.bool(true,  "SMA 1", inline = "ma1", group = G_SMA)
+ma1Len  = input.int(49,     "len",   inline = "ma1", minval = 1, group = G_SMA)
+ma1Gate = input.bool(true,  "gate",  inline = "ma1", group = G_SMA)
+ma1Col  = input.color(color.orange, "", inline = "ma1", group = G_SMA)
+
+ma2On   = input.bool(true,  "SMA 2", inline = "ma2", group = G_SMA)
+ma2Len  = input.int(200,    "len",   inline = "ma2", minval = 1, group = G_SMA)
+ma2Gate = input.bool(false, "gate",  inline = "ma2", group = G_SMA)
+ma2Col  = input.color(color.blue,   "", inline = "ma2", group = G_SMA)
+
+ma3On   = input.bool(false, "SMA 3", inline = "ma3", group = G_SMA)
+ma3Len  = input.int(20,     "len",   inline = "ma3", minval = 1, group = G_SMA)
+ma3Gate = input.bool(false, "gate",  inline = "ma3", group = G_SMA)
+ma3Col  = input.color(color.purple, "", inline = "ma3", group = G_SMA)
 confirmMin = input.int(60,       "Minutes allowed for the SMA to confirm",
-     minval = 0, tooltip = "After the three Supertrends line up, price has this long to close on the correct side of the SMA. 0 = the SMA must already agree on the alignment bar.", group = G_SMA)
+     minval = 0, tooltip = "After the three Supertrends line up, price has this long to close on the correct side of every gating SMA. 0 = they must already agree on the alignment bar.", group = G_SMA)
 oneShot    = input.bool(true,    "Only one entry per alignment",
      tooltip = "Blocks a re-entry after a stop-out until the Supertrends line up again from scratch.", group = G_SMA)
 
@@ -91,7 +108,8 @@ eodT  = input.string("1530", "",          inline = "eod", group = G_R)
 // ---------------------------------------------------------------------------
 var string G_L = "Labels"
 showAgreeLbl = input.bool(true, "Label 3-Supertrend agreement (Buy / Sell)", group = G_L)
-showConfLbl  = input.bool(true, "Label the 49 SMA confirmation (Confirmed)", group = G_L)
+showConfLbl  = input.bool(true, "Label the SMA confirmation (Confirmed)",
+     tooltip = "Only drawn when at least one SMA is set as a gate — with no gate there is nothing to confirm.", group = G_L)
 lblSize      = input.string("Small", "Label size", options = ["Tiny", "Small", "Normal", "Large"], group = G_L)
 
 // ---------------------------------------------------------------------------
@@ -137,7 +155,21 @@ f_st(src, periods, mult) =>
 [t2, up2v, dn2v] = f_st(stSrc, p2, m2)
 [t3, up3v, dn3v] = f_st(stSrc, p3, m3)
 
-sma49 = ta.sma(smaSrc, smaLen)
+ma1 = ta.sma(smaSrc, ma1Len)
+ma2 = ta.sma(smaSrc, ma2Len)
+ma3 = ta.sma(smaSrc, ma3Len)
+
+// a slot only gates when it is both switched on and marked as a gate
+g1 = ma1On and ma1Gate
+g2 = ma2On and ma2Gate
+g3 = ma3On and ma3Gate
+
+f_side(use, ma, dir) => not use or (dir == 1 ? close > ma : dir == -1 ? close < ma : false)
+
+anyGate = g1 or g2 or g3
+
+smaLongOk  = f_side(g1, ma1,  1) and f_side(g2, ma2,  1) and f_side(g3, ma3,  1)
+smaShortOk = f_side(g1, ma1, -1) and f_side(g2, ma2, -1) and f_side(g3, ma3, -1)
 
 allLong  = t1 ==  1 and t2 ==  1 and t3 ==  1
 allShort = t1 == -1 and t2 == -1 and t3 == -1
@@ -170,7 +202,7 @@ agreeNow  = alignDir != 0 and alignDir != nz(alignDir[1])
 
 // the first bar inside that one-hour window where price closes on the correct
 // side of the 49 SMA — the confirmation the entry waits for
-smaAgrees  = alignDir == 1 ? close > sma49 : alignDir == -1 ? close < sma49 : false
+smaAgrees  = alignDir == 1 ? smaLongOk : alignDir == -1 ? smaShortOk : false
 confirmNow = inConfirmWin and smaAgrees and not confDone
 if confirmNow
     confDone := true
@@ -203,9 +235,6 @@ w4End = f_hit(f_hh(w4e), f_mm(w4e))
 // ---------------------------------------------------------------------------
 // Entries
 // ---------------------------------------------------------------------------
-smaLongOk  = close > sma49
-smaShortOk = close < sma49
-
 flat = strategy.position_size == 0
 entryAllowed = flat and inAnyWin and not eodHit and barstate.isconfirmed and
      (not oneShot or not alignUsed)
@@ -260,7 +289,9 @@ plot(t2 == -1 ? dn2v : na, "ST2 down", color = color.new(color.red,   40), style
 plot(t3 ==  1 ? up3v : na, "ST3 up",   color = color.new(color.green, 40), style = plot.style_linebr, linewidth = 1)
 plot(t3 == -1 ? dn3v : na, "ST3 down", color = color.new(color.red,   40), style = plot.style_linebr, linewidth = 1)
 
-plot(sma49, "49 SMA", color = color.new(color.orange, 0), linewidth = 2)
+plot(ma1On ? ma1 : na, "SMA 1", color = ma1Col, linewidth = 2)
+plot(ma2On ? ma2 : na, "SMA 2", color = ma2Col, linewidth = 2)
+plot(ma3On ? ma3 : na, "SMA 3", color = ma3Col, linewidth = 2)
 
 bgcolor(shadeWin and inAnyWin ? color.new(color.blue, 92) : na, title = "Trading window")
 bgcolor(allLong ? color.new(color.green, 88) : allShort ? color.new(color.red, 88) : na, title = "Supertrend agreement")
@@ -281,7 +312,7 @@ if showAgreeLbl and agreeNow
          color     = alignDir == 1 ? color.new(color.green, 0) : color.new(color.red, 0),
          textcolor = color.white, size = lblSizeVal)
 
-if showConfLbl and confirmNow
+if showConfLbl and confirmNow and anyGate
     label.new(bar_index, confY,
          text      = "Confirmed",
          style     = alignDir == 1 ? label.style_label_up : label.style_label_down,

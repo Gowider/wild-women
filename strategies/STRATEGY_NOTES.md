@@ -1,4 +1,4 @@
-# Triple Supertrend + 49 SMA — session-window strategy
+# Triple Supertrend + SMA filters — session-window strategy
 
 `triple_supertrend_sma49.pine` — Pine Script v5, built for a 5-minute chart.
 Paste it into TradingView's Pine Editor and **Add to chart**.
@@ -9,15 +9,37 @@ Paste it into TradingView's Pine Editor and **Add to chart**.
    The Supertrend maths is a line-for-line port of the v4 study you sent, so the
    plots match that indicator bar for bar.
    The bar they line up on gets a green **Buy** or red **Sell** label.
-2. **The 49 SMA confirms.** Price must *close* above the 49 SMA for a long,
-   below it for a short. That bar gets a blue **Confirmed** label. If the SMA is
-   already on the right side when the three line up, agreement and confirmation
-   happen on the same bar and both labels print.
-3. **The clock.** The SMA has 60 minutes (12 bars on a 5-min chart) from the
+2. **The SMAs confirm.** Price must *close* on the trend side of every SMA
+   marked as a gate — above for a long, below for a short. That bar gets a blue
+   **Confirmed** label. If price is already onside when the three line up,
+   agreement and confirmation happen on the same bar and both labels print.
+3. **The clock.** The SMAs have 60 minutes (12 bars on a 5-min chart) from the
    alignment bar to confirm. After that the setup is dead until the three
    Supertrends line up again from scratch.
 4. **A trading window is open.** Entries only fire inside one of the four
    windows; the shaded background shows them.
+
+## SMA slots
+
+Three independent SMAs, each with its own row of inputs: **on/off**, **length**,
+**gate**, **colour**.
+
+| Slot | Default | Gate | Role |
+|------|---------|------|------|
+| SMA 1 | 49  | yes | the entry signal — price has to close on its trend side |
+| SMA 2 | 200 | no  | plotted for context; tick `gate` to make it a second filter |
+| SMA 3 | 20  | —   | off, a spare slot |
+
+- **on/off** controls whether the line is drawn.
+- **gate** controls whether it has a say in entries. A slot only gates when it
+  is both on *and* gated, so switching a slot off also removes it from the entry
+  rules.
+- With **no** slot gating, there is nothing to confirm: entries fire as soon as
+  the three Supertrends agree inside a window, and the Confirmed label is
+  suppressed.
+- Turning on SMA 2's gate makes the setup need price on the right side of both
+  the 49 and the 200 — a much tighter filter, and worth backtesting before you
+  commit to it.
 
 `Only one entry per alignment` (on by default) stops the strategy re-entering
 the same setup after a stop-out. Turn it off if you want it to keep trying while

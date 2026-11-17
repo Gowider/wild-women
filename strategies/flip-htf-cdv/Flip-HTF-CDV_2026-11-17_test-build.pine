@@ -1,0 +1,1526 @@
+//@version=6
+strategy("Flip + HTF + CDV", shorttitle="Flip+HTF+CDV", overlay=true, initial_capital=1000000, currency=currency.USD, default_qty_type=strategy.fixed, default_qty_value=2, pyramiding=0, process_orders_on_close=false, max_boxes_count=500, max_lines_count=500, max_labels_count=500, behind_chart=false, commission_type=strategy.commission.cash_per_contract, commission_value=2.5)
+
+// ═════════════════════════════════════════════════════════════════════════
+// FLIP + HTF — combined strategy v1 (Oct 5, 2026), 1-hour ES/MES chart.
+//  Two systems in one script, ONE position at a time:
+//   - 4HR Flip v14 (settings group "FLIP · ...") and HTF Corridor v3.3
+//     (group "HTF · ..."), each with its own settings, stops, breakeven
+//     and flat times, exactly as in their own scripts.
+//   - STAY IN THE TRADE YOU'RE IN: while one system holds a trade, the other
+//     sets up nothing; it waits until the position is flat.
+//   - While flat, both can have an entry order resting. They share one
+//     one-cancels-other group: the first to fill cancels the other.
+//   - SAME CANDLE: if both set up a new trade on the same candle, the
+//     "Same-Candle Priority" system keeps its order and the other's is
+//     dropped. Default = HTF Corridor (it won 9 of the 12 same-candle cases
+//     in the Oct 2025 - Oct 2026 exports, +$3,015 vs +$1,753 per contract).
+//   - Every entry/exit is tagged "FLIP ..." or "HTF ..." for analysis.
+//  Order IDs: F Long / F Short (Flip), H Long / H Short (HTF).
+//
+//  CDV CONFIRMATION (test build, Nov 17, 2026) — from CDV Taper v1.5
+//   - The CDV (LonesomeTheBlue math, Heikin Ashi CDV, green 20 / red 50 lines)
+//     is calculated here; nothing is drawn, values are in the Data Window.
+//   - HTF Corridor entries (zone + springboard) only set up when the CDV
+//     agrees: longs need green over red, shorts need red over green (or the
+//     HA CDV candle colour, or both — "CDV must agree by").
+//   - Same filter available for the 4HR Flip (OFF by default).
+//   - CDV Timeframe: blank = chart timeframe; a higher timeframe uses only
+//     completed candles of that timeframe (no repaint).
+//   - Entry Hours / Entry Days (NY): gate new setups for both systems by the
+//     hour/day the order would first be able to fill. All on by default.
+// ═════════════════════════════════════════════════════════════════════════
+
+// ───────────── Combined ─────────────
+g_hideAll  = input.bool(false, "Hide ALL Trade Signals (for recording)", group="Combined", tooltip="One switch for both systems: no orders, no trade arrows, no setup labels or entry lines.")
+g_prioSys  = input.string("HTF Corridor", "Same-Candle Priority", options=["HTF Corridor", "4HR Flip"], group="Combined", tooltip="When both systems set up a new trade on the same candle, this one keeps its order. HTF won 9 of the 12 same-candle cases last year.")
+g_prioHTF  = g_prioSys == "HTF Corridor"
+g_ownId    = strategy.opentrades > 0 ? strategy.opentrades.entry_id(0) : ""
+g_lastId   = strategy.opentrades > 0 ? strategy.opentrades.entry_id(strategy.opentrades - 1) : strategy.closedtrades > 0 ? strategy.closedtrades.entry_id(strategy.closedtrades - 1) : ""
+g_fOwn     = str.startswith(g_ownId, "F ")
+g_hOwn     = str.startswith(g_ownId, "H ")
+g_fPos     = g_fOwn ? strategy.position_size : 0.0
+g_hPos     = g_hOwn ? strategy.position_size : 0.0
+g_flat     = strategy.position_size == 0
+bool g_hNew = false                 // HTF set up a new trade on this candle (set inside the HTF engine)
+var bool g_hKill = false            // the Flip took priority on the previous candle -> HTF drops its setup
+
+// ═════════════════════════ CDV CONFIRMATION (from CDV Taper v1.5) ═════════════════════════
+c_grp     = "CDV Confirmation"
+c_useHTF  = input.bool(true,  "Confirm HTF Corridor entries with CDV", group=c_grp, tooltip="HTF longs only set up when the CDV agrees long, HTF shorts only when it agrees short. Applies to zone and springboard setups.")
+c_useFlip = input.bool(false, "Confirm 4HR Flip entries with CDV", group=c_grp, tooltip="Same rule for the 4HR Flip sweeps (reversals included). Off by default.")
+c_mode    = input.string("CDV lines (green vs red)", "CDV must agree by", options=["CDV lines (green vs red)", "HA CDV candle color", "Lines AND candle color"], group=c_grp, tooltip="Lines: green over red = long OK, red over green = short OK. Candle: the Heikin Ashi CDV candle is green (long OK) or red (short OK).")
+c_tf      = input.timeframe("", "CDV Timeframe (blank = chart)", group=c_grp, tooltip="Blank = the chart's own timeframe. A HIGHER timeframe (e.g. 240) uses that timeframe's last COMPLETED candle, so it never repaints. A timeframe lower than the chart is ignored (chart is used).")
+c_maType  = input.string("SMA", "Line type", options=["SMA", "EMA"], group=c_grp)
+c_fastLen = input.int(20, "Green (fast) length", minval=1, group=c_grp)
+c_slowLen = input.int(50, "Red (slow) length", minval=1, group=c_grp)
+
+// returns [line side (1 green over red / -1 red over green / 0), HA CDV candle colour (1 green / -1 red)]
+c_cdv() =>
+    c_tw    = high - math.max(open, close)
+    c_bw    = math.min(open, close) - low
+    c_body  = math.abs(close - open)
+    c_den   = c_tw + c_bw + c_body
+    c_rate  = c_den > 0 ? 0.5 * (c_tw + c_bw + 2 * c_body) / c_den : 0.5
+    c_delta = (close >= open ? 1.0 : -1.0) * nz(volume) * c_rate
+    c_cum   = ta.cum(c_delta)
+    c_o     = nz(c_cum[1], c_cum)
+    c_h     = math.max(c_cum, c_o)
+    c_l     = math.min(c_cum, c_o)
+    c_haC   = (c_o + c_h + c_l + c_cum) / 4
+    var float c_haO = na
+    c_haO  := na(c_haO[1]) ? (c_o + c_cum) / 2 : (c_haO[1] + c_haC[1]) / 2
+    c_gS    = ta.sma(c_haC, c_fastLen)
+    c_gE    = ta.ema(c_haC, c_fastLen)
+    c_rS    = ta.sma(c_haC, c_slowLen)
+    c_rE    = ta.ema(c_haC, c_slowLen)
+    c_g     = c_maType == "SMA" ? c_gS : c_gE
+    c_r     = c_maType == "SMA" ? c_rS : c_rE
+    int c_side  = na(c_r) or na(c_g) ? 0 : c_g > c_r ? 1 : c_g < c_r ? -1 : 0
+    int c_haDir = c_haC >= c_haO ? 1 : -1
+    [c_side, c_haDir]
+
+c_cdvPrev() =>
+    [c_s, c_d] = c_cdv()
+    [c_s[1], c_d[1]]
+
+c_useOther = c_tf != "" and timeframe.in_seconds(c_tf) > timeframe.in_seconds(timeframe.period)
+c_tfReq    = c_useOther ? c_tf : timeframe.period
+[c_sideChart, c_haChart] = c_cdv()
+[c_sideOther, c_haOther] = request.security(syminfo.tickerid, c_tfReq, c_cdvPrev(), lookahead=barmerge.lookahead_on)
+c_cdvSide = c_useOther ? nz(c_sideOther) : nz(c_sideChart)
+c_cdvHA   = c_useOther ? nz(c_haOther)   : nz(c_haChart)
+
+c_agrees(int c_dir) =>
+    c_lineOk = c_cdvSide == c_dir
+    c_candOk = c_cdvHA == c_dir
+    c_mode == "CDV lines (green vs red)" ? c_lineOk : c_mode == "HA CDV candle color" ? c_candOk : (c_lineOk and c_candOk)
+c_okHTF(int c_dir)  => not c_useHTF  or c_agrees(c_dir)
+c_okFlip(int c_dir) => not c_useFlip or c_agrees(c_dir)
+
+// ═════════════════════════ ENTRY HOURS / DAYS (New York) ═════════════════════════
+// Checked on the setup candle, by the hour/day its order can first fill (= that candle's close time).
+e_tz  = "America/New_York"
+e_grpH = "Entry Hours (New York)"
+e_h00 = input.bool(true, "00", inline="eh1", group=e_grpH), e_h01 = input.bool(true, "01", inline="eh1", group=e_grpH), e_h02 = input.bool(true, "02", inline="eh1", group=e_grpH), e_h03 = input.bool(true, "03", inline="eh1", group=e_grpH), e_h04 = input.bool(true, "04", inline="eh1", group=e_grpH), e_h05 = input.bool(true, "05", inline="eh1", group=e_grpH)
+e_h06 = input.bool(true, "06", inline="eh2", group=e_grpH), e_h07 = input.bool(true, "07", inline="eh2", group=e_grpH), e_h08 = input.bool(true, "08", inline="eh2", group=e_grpH), e_h09 = input.bool(true, "09", inline="eh2", group=e_grpH), e_h10 = input.bool(true, "10", inline="eh2", group=e_grpH), e_h11 = input.bool(true, "11", inline="eh2", group=e_grpH)
+e_h12 = input.bool(true, "12", inline="eh3", group=e_grpH), e_h13 = input.bool(true, "13", inline="eh3", group=e_grpH), e_h14 = input.bool(true, "14", inline="eh3", group=e_grpH), e_h15 = input.bool(true, "15", inline="eh3", group=e_grpH), e_h16 = input.bool(true, "16", inline="eh3", group=e_grpH), e_h17 = input.bool(true, "17", inline="eh3", group=e_grpH)
+e_h18 = input.bool(true, "18", inline="eh4", group=e_grpH), e_h19 = input.bool(true, "19", inline="eh4", group=e_grpH), e_h20 = input.bool(true, "20", inline="eh4", group=e_grpH), e_h21 = input.bool(true, "21", inline="eh4", group=e_grpH), e_h22 = input.bool(true, "22", inline="eh4", group=e_grpH), e_h23 = input.bool(true, "23", inline="eh4", group=e_grpH)
+e_grpW = "Entry Days (New York)"
+e_dSun = input.bool(true, "Sun", inline="ed1", group=e_grpW), e_dMon = input.bool(true, "Mon", inline="ed1", group=e_grpW), e_dTue = input.bool(true, "Tue", inline="ed1", group=e_grpW), e_dWed = input.bool(true, "Wed", inline="ed1", group=e_grpW), e_dThu = input.bool(true, "Thu", inline="ed1", group=e_grpW), e_dFri = input.bool(true, "Fri", inline="ed1", group=e_grpW)
+
+e_t   = na(time_close) ? time : time_close
+e_hr  = hour(e_t, e_tz)
+e_hourOK = e_hr == 0 ? e_h00 : e_hr == 1 ? e_h01 : e_hr == 2 ? e_h02 : e_hr == 3 ? e_h03 : e_hr == 4 ? e_h04 : e_hr == 5 ? e_h05 : e_hr == 6 ? e_h06 : e_hr == 7 ? e_h07 : e_hr == 8 ? e_h08 : e_hr == 9 ? e_h09 : e_hr == 10 ? e_h10 : e_hr == 11 ? e_h11 : e_hr == 12 ? e_h12 : e_hr == 13 ? e_h13 : e_hr == 14 ? e_h14 : e_hr == 15 ? e_h15 : e_hr == 16 ? e_h16 : e_hr == 17 ? e_h17 : e_hr == 18 ? e_h18 : e_hr == 19 ? e_h19 : e_hr == 20 ? e_h20 : e_hr == 21 ? e_h21 : e_hr == 22 ? e_h22 : e_h23
+e_dow = dayofweek(e_t, e_tz)
+e_dayOK = e_dow == dayofweek.sunday ? e_dSun : e_dow == dayofweek.monday ? e_dMon : e_dow == dayofweek.tuesday ? e_dTue : e_dow == dayofweek.wednesday ? e_dWed : e_dow == dayofweek.thursday ? e_dThu : e_dow == dayofweek.friday ? e_dFri : false
+e_entryOK = e_hourOK and e_dayOK
+
+// ═════════════════════════ HTF CORRIDOR ENGINE (runs first) ═════════════════════════
+
+// ═════════════════════════════════════════════════════════════════════════
+// HTF CORRIDOR v3.3 (Oct 5, 2026) — built for the 30-minute chart (works on 1-hour too).
+//
+//  v3 CHANGES (from the Oct 2025 - Oct 2026 trade analysis, 181 trades)
+//  1. BREAKEVEN TIMING (Risk group): "Intrabar" moves the stop to breakeven
+//     the moment price reaches the trigger, inside the candle, instead of
+//     waiting for a later candle's close. 25 losers had been +10 pts and still
+//     lost $13,650. How it works: a trailing stop that switches on at
+//     entry +/- trigger and starts at entry + lock, then follows price at
+//     the trigger distance (10 pts by default). The fixed stop and the zone
+//     target stay in place. "Candle close (original)" = the old behaviour.
+//  2. SKIP LONGS 6:B + O:I (Overnight Rules): 6 am POC below the NY zone AND
+//     the 07:00 open inside the overnight zone. 21 trades, -$5,510.
+//  3. COMMISSION default is now $2.50 per contract per side (Properties tab).
+//     The last export charged $60 per 2-contract trade. Set this to your
+//     broker's real cost.
+//  4. SKIP LONGS AFTER A NORMAL-WIDTH OVERNIGHT (W:N) (Overnight Rules):
+//     20 trades, 3 wins, -$225 (-$5,415 without the best one).
+//  Every change is a switch: turn it off to compare before/after.
+//
+//  v3.3 (Oct 5, 2026) — from the Oct 2025 - Oct 2026 hour-by-hour test
+//   EXTRA SETUP WINDOWS (group "Extra Windows"):
+//     Window 2  setup candle 13:00, orders rest 14:00-15:00, BOTH directions
+//               (14:00 entries: 48 trades, +$10,045, PF 1.74)
+//     Window 3  setup candle 01:00, orders rest 02:00-03:00, LONGS ONLY
+//               (02:00 longs: 25 trades, +$5,950, PF 2.11; shorts lost)
+//     Window 1 is the Session group (setups 07:00-10:00, cancel 11:00).
+//   NO 10:00 LONGS: window-1 long orders are cancelled at 10:00 (longs filled
+//     at 10:00 won 2 of 17). Shorts keep the 11:00 cancel.
+//   SKIP LONGS when the 6 am POC is INSIDE the zone (6:I: 18 longs, +$395,
+//     -$1,145 without the best) and SKIP SHORTS when it is BELOW (6:B:
+//     5 shorts, -$1,150). Both switches are under Overnight Rules.
+//   Note: window 3 trades at 02:00, before today's 6 am POC exists, so its
+//   overnight tags and rules use the previous morning's readings.
+//
+//  v3.2 (Oct 4, 2026) — W:N+ O:A SHORTS are now SKIPPED by default
+//  (Overnight Rules > "W:N+ O:A Short Setup"). The v3.1 trend flip did not
+//  test well; it stays available as an option. "Take the short" = v3.
+//
+//  v3.1 (Oct 4, 2026) — TREND FLIP (Overnight Rules)
+//  A SHORT setup after a normal-width overnight RALLY (W:N+) with the 07:00
+//  open ABOVE the overnight zone (O:A) is flipped to a LONG with the trend:
+//  11 such shorts last year went 2-9 for -$4,085 and caused most of the
+//  Dec 2025 - Feb 2026 drawdown. The long enters at the same candle's POC,
+//  stop below that candle's low + buffer (Max Stop Size still applies),
+//  target = entry + R multiple (default 2R). Breakeven + EOD still apply.
+//  Tagged "Trend Long", exits "Trend TP". Not blocked by the long-skip rules
+//  (they are about fading longs into the zone, this is a different setup).
+//
+//  THE ZONE (corridor)
+//  - POC of the 10 am window and POC of the 2 pm window (New York). The
+//    window length is an input (default 60 min), so on a 30-minute chart the
+//    10 am POC is built from the 10:00 + 10:30 candles combined — the same
+//    zone the 1-hour version used.
+//  - Zone = range between the most recent 10 am POC and 2 pm POC, shaded.
+//    It is LIVE: it moves as soon as a new zone POC finishes.
+//
+//  SECONDARY ZONE (2 pm -> 6 am)
+//  - POC of the 6 am window (same window length). Secondary zone = range
+//    between the most recent 2 pm POC and the most recent 6 am POC, shaded
+//    purple, with 6 am lines aqua (today) / teal (yesterday).
+//  - Used by the "Overnight zone stair-step" trend measure (today's overnight
+//    zone vs yesterday's). Entries/targets still use the primary 10-2 zone.
+//
+//  ENTRIES — always trade TOWARD the zone
+//  - At each candle close from 04:00 until the Last Setup Time, while flat:
+//      closed ABOVE the zone -> SHORT at that candle's POC
+//      closed BELOW the zone -> LONG  at that candle's POC
+//      closed INSIDE         -> wait
+//  - Filters (recommended defaults from the 1-hour trade analysis):
+//      Direction: Both (shorts-only was a 3-month finding that flipped)
+//      Max stop size: 10 pts (stops > 10 pts cost $34k over 25 losers)
+//      Last setup candle closes by 12:30; unfilled orders cancelled 13:00
+//      Skip Thursdays: available, OFF by default (not enough data yet)
+//  - The order rests at the POC until filled; cancelled if the stop level
+//    trades first, if a later candle closes on the other side of the zone,
+//    at the cancel time, or at EOD.
+//
+//  BASELINE (Oct 2026, 1-hour chart, Jan 2023 - Oct 2026):
+//  - Overnight zone stair-step + 2-tick stop buffer: +$191,425, PF 1.90,
+//    max DD -$15,500, 739 trades.
+//  - Overnight zone stair-step + 1-tick stop buffer (CURRENT DEFAULTS):
+//    ~+$202k, PF ~2.0, max DD -$14,325.
+//  Other defaults: setups 07:00-10:00, unfilled orders cancelled 11:00,
+//  With-trend only on trend days, 30-minute zone POC window, Thursdays on.
+//  (The 3-day % change lookback was the previous trend measure: +$206,375,
+//  PF 1.51, DD -$20,100.)
+//
+//  OVERNIGHT RULES (from the 4-year tag analysis, Oct 2026)
+//  - Skip LONGS after a wide overnight drop (W:W-): 74 trades, +$650, PF 1.02.
+//  - Skip LONGS when the 6 am POC is below the zone and the open is inside
+//    the overnight zone (6:B O:I) — v3.
+//  - Skip LONGS after a normal-width overnight (W:N) — v3.
+//  - Size up ONLY the two strongest setups (default 3 contracts, others 2):
+//      SHORTS after a wide overnight rally (W:W+)   PF 2.76, 154 trades
+//      LONGS after a tight overnight drift down (T:T-)  PF 3.13, 116 trades
+//    Sized entries show " SZ3" at the end of the signal name.
+//
+//  OVERNIGHT CONTEXT TAGS (Trading Mode > Tag Entries, on by default)
+//  Each entry's signal name gets " | 6:x W:x O:x S:x" for analysis:
+//    6 = 6 am POC vs NY zone (A above / I inside / B below)
+//    W = overnight zone width vs 20-day avg (T tight / N normal / W wide)
+//        + direction (+ up / - down), e.g. W:W- = wide overnight drop
+//    O = 07:00 open vs overnight zone (A / I / B)
+//    S = overnight stair-step (U up / D down / O overlapping)
+//  Tags change no trades - run once and send the export.
+//
+//  OVERNIGHT ZONE STAIR-STEP (Trend Measure option)
+//  - Each morning, when the 6 am POC finishes, today's overnight zone
+//    (yesterday's 2 pm POC -> today's 6 am POC) is compared with yesterday's
+//    overnight zone. Overlapping = balance, trade normally. Stacked fully
+//    above = uptrend day, fully below = downtrend day; the regime mode
+//    (With-trend only / Skip / Springboard) then applies in that direction.
+//
+//  MARKET REGIME FILTER
+//  - Built from completed DAILY candles only (yesterday back), so it never
+//    repaints. Trending = the daily close moved more than 3% over the last
+//    20 days (or: efficiency ratio above 0.20). Trending days are tinted.
+//  - "Skip trending days": no new setups. "With-trend only": on trending
+//    days only take setups in the trend's direction.
+//  - Direction now defaults to Both (longs out-earned shorts over 21 months).
+//
+//  SPRINGBOARD (default regime mode on trending days)
+//  - Review window: 14:00 yesterday -> 08:30 today. Did price trade through
+//    yesterday's 10 am POC? YES -> today trades normally. NO -> SPRINGBOARD.
+//  - Direction = SHORT-TERM trend: yesterday's 10 am POC below price at 08:30
+//    -> longs only; above price -> shorts only. (The 20-day measure only
+//    decides IF it is a trending day, not which way to trade.)
+//  - Springboard: the zone is a launch pad, not a magnet. In that direction
+//    only, rest an order at the zone edge on the trend side: long = buy at
+//    the zone TOP (limit when price taps down into it,
+//    stop when price exits up through it); downtrend = sell at the zone
+//    BOTTOM. Stop = far side of the zone + buffer (capped by Max Stop Size),
+//    target = 2R, breakeven + EOD still apply. Max 2 per day. The order is
+//    re-placed each candle so it tracks the live zone.
+//  - Before 08:30 decides, trending days wait (no new setups) unless the
+//    sweep already happened. Day tint: green = springboard, red = trending
+//    but normal, gray = waiting.
+//
+//  EXITS
+//  - Target: the FAR edge of the live zone (shorts: zone low, longs: high).
+//  - Stop: beyond the entry candle's wick + buffer.
+//  - Breakeven: once the trade has been +10 pts in its favour the stop moves
+//    to entry + 1 tick — intrabar by default (v3), or on candles AFTER the
+//    fill candle in "Candle close (original)" mode.
+//  - EOD: always flat at the close of the candle containing 15:30 (exactly
+//    15:30 on the 30-minute chart). If an early close / holiday skips that
+//    candle, the position is closed on the first candle after it and all
+//    orders are cancelled — nothing is ever carried overnight.
+// ═════════════════════════════════════════════════════════════════════════
+
+h_enableTradingIn = input.bool(true, "Enable Trading", group="HTF · Trading Mode", tooltip="Uncheck for display only.")
+h_hideSignals     = g_hideAll or input.bool(false, "Hide All Trade Signals (for recording)", group="HTF · Trading Mode", tooltip="One switch for clean screen recordings: no orders (so no TradingView trade arrows), no entry/stop lines, no entry/exit text. Zones, POC lines and dots stay on the chart.")
+h_enableTrading   = h_enableTradingIn and not h_hideSignals
+h_showTagLabels   = input.bool(true, "Show Overnight Tags on Chart", group="HTF · Trading Mode", tooltip="Prints the overnight tags (e.g. '6:A W:W- O:I S:O') next to each setup's entry line, so you can read them on the chart while reviewing.")
+h_skipWideDropLongs = input.bool(true, "Skip Longs After a Wide Overnight Drop", group="HTF · Overnight Rules", tooltip="Wide overnight zone (> 1.25x its 20-day average) AND the 6 am POC below the 2 pm POC (W:W-). 4-year test: 74 longs, +$650, PF 1.02, -$19.8k drawdown on their own.")
+h_skipBelowInsideLongs = input.bool(true, "Skip Longs: 6 am POC Below Zone + Open Inside Overnight Zone (6:B O:I)", group="HTF · Overnight Rules", tooltip="v3. The 6 am POC is below the 10 am / 2 pm zone AND the 07:00 open is inside the overnight zone (2 pm -> 6 am). Oct 2025 - Oct 2026: 21 longs, 3 wins, -$5,510.")
+h_skipNormalLongs = input.bool(true, "Skip Longs After a Normal-Width Overnight (W:N)", group="HTF · Overnight Rules", tooltip="v3. Overnight zone width between 0.75x and 1.25x its 20-day average. Oct 2025 - Oct 2026: 20 longs, 3 wins, -$225 (-$5,415 without the single best trade).")
+h_noaMode         = input.string("Skip (no trade)", "W:N+ O:A Short Setup", options=["Skip (no trade)", "Take the short (original)", "Trade long with the trend"], group="HTF · Overnight Rules", tooltip="v3.2. A SHORT setup (candle closed above the zone) after a normal-width overnight rally (W:N+) with the 07:00 open ABOVE the overnight zone (O:A). Last year: 11 shorts, 2 wins, -$4,085, most of the Dec 2025 - Feb 2026 drawdown. Skip = no trade (default). Take the short = original v3 behaviour. Trade long = the v3.1 trend flip (did not test well).")
+h_flipRR          = input.float(2.0, "Trend Long Target (R multiple)", minval=0.25, step=0.25, group="HTF · Overnight Rules", tooltip="Target = entry + this many times the entry-to-stop distance.")
+h_skipInsideLongs = input.bool(true, "Skip Longs: 6 am POC Inside the Zone (6:I)", group="HTF · Overnight Rules", tooltip="v3.3. Oct 2025 - Oct 2026: 18 longs, 6 wins, +$395 (-$1,145 without the single best).")
+h_skipBelowShorts = input.bool(true, "Skip Shorts: 6 am POC Below the Zone (6:B)", group="HTF · Overnight Rules", tooltip="v3.3. Oct 2025 - Oct 2026: 5 shorts, 1 win, -$1,150.")
+h_sizeStrong      = input.bool(true, "Size Up the Two Strongest Overnight Setups", group="HTF · Overnight Rules", tooltip="ONLY these two get the larger size: SHORTS after a wide overnight rally (W:W+, PF 2.76, 154 trades, profitable 4/4 years) and LONGS after a tight overnight drift down (T:T-, PF 3.13, 116 trades, 4/4 years). Every other trade keeps the normal Contracts setting.")
+h_strongQty       = input.int(3, "Contracts for Strong Setups", minval=1, maxval=20, group="HTF · Overnight Rules")
+h_tagOvernight    = input.bool(true, "Tag Entries with Overnight Context", group="HTF · Trading Mode", tooltip="Appends overnight tags to every entry's signal name for analysis, e.g. 'Zone Long | 6:A W:T O:A S:U'. Changes no trades.")
+
+// ───────────── POC calculation ─────────────
+h_lowerTF    = input.timeframe("30", "Intrabar Resolution", group="HTF · POC", tooltip="Lower timeframe sampled inside each candle to build its POC. Your tests: 30-min chart + 30-min intrabar did best (the POC then sits at the candle's close), 1-hour chart + 30-min intrabar was close behind. 1 = a true volume profile.")
+h_rowTicks   = input.int(4, "Row Size (ticks)", minval=1, group="HTF · POC", tooltip="Price bucket size for every POC. 4 ticks = 1 point on ES/MES.")
+h_maxRows    = input.int(400, "Max Rows per Candle", minval=3, maxval=1000, group="HTF · POC")
+
+// ───────────── Zone ─────────────
+h_keyTz      = input.string("America/New_York", "Time Zone", group="HTF · Zone")
+h_k1Hour     = input.int(10, "Zone POC 1 — Hour", minval=0, maxval=23, group="HTF · Zone", inline="h_k1")
+h_k1Min      = input.int(0,  "Min", minval=0, maxval=59, group="HTF · Zone", inline="h_k1")
+h_k2Hour     = input.int(14, "Zone POC 2 — Hour", minval=0, maxval=23, group="HTF · Zone", inline="h_k2")
+h_k2Min      = input.int(0,  "Min", minval=0, maxval=59, group="HTF · Zone", inline="h_k2")
+h_zoneLenMin = input.int(30, "Zone POC Window (minutes)", minval=1, maxval=240, group="HTF · Zone", tooltip="60 = the POC of the full 10:00-11:00 hour (and 14:00-15:00), even on a 30-minute chart. 30 = just the 10:00 / 14:00 30-minute candle.")
+h_showKey    = input.bool(true, "Show 10 am / 2 pm POC Lines", group="HTF · Zone")
+h_k1NewCol   = input.color(color.white,  "10 am — Today", group="HTF · Zone", inline="h_c1")
+h_k1OldCol   = input.color(color.blue,   "Yesterday",     group="HTF · Zone", inline="h_c1")
+h_k2NewCol   = input.color(color.yellow, "2 pm — Today",  group="HTF · Zone", inline="h_c2")
+h_k2OldCol   = input.color(color.orange, "Yesterday",     group="HTF · Zone", inline="h_c2")
+h_keyWidth   = input.int(2, "Key Line Width", minval=1, maxval=4, group="HTF · Zone")
+h_showZone   = input.bool(true, "Shade the Zone", group="HTF · Zone")
+h_zoneCol    = input.color(color.new(color.gray, 82), "Zone Shading", group="HTF · Zone")
+
+// ───────────── Secondary zone (2 pm -> 6 am) ─────────────
+h_showZone2  = input.bool(true, "Show Secondary Zone (2 pm -> 6 am)", group="HTF · Secondary Zone", tooltip="Range between the most recent 2 pm POC and the most recent 6 am POC. Feeds the 'Overnight zone stair-step' trend measure and the overnight trade tags; entries and targets still use the primary 10 am / 2 pm zone.")
+h_k3Hour     = input.int(6, "Secondary POC — Hour", minval=0, maxval=23, group="HTF · Secondary Zone", inline="h_k3")
+h_k3Min      = input.int(0, "Min", minval=0, maxval=59, group="HTF · Secondary Zone", inline="h_k3")
+h_k3NewCol   = input.color(color.aqua,  "6 am — Today", group="HTF · Secondary Zone", inline="h_c3")
+h_k3OldCol   = input.color(color.teal,  "Yesterday",    group="HTF · Secondary Zone", inline="h_c3")
+h_zone2Col   = input.color(color.new(color.purple, 85), "Secondary Zone Shading", group="HTF · Secondary Zone")
+
+// ───────────── Session ─────────────
+h_startHour  = input.int(7,  "First Setup Candle — Hour", minval=0, maxval=23, group="HTF · Session", inline="h_st")
+h_startMin   = input.int(0,  "Min", minval=0, maxval=59, group="HTF · Session", inline="h_st")
+h_lastHour   = input.int(10, "Last Setup Time — Hour", minval=0, maxval=23, group="HTF · Session", inline="h_ls", tooltip="A candle can only set up a trade if it CLOSES at or before this time.")
+h_lastMin    = input.int(0, "Min", minval=0, maxval=59, group="HTF · Session", inline="h_ls")
+h_cxlHour    = input.int(11, "Cancel Unfilled Orders — Hour", minval=0, maxval=23, group="HTF · Session", inline="h_cx")
+h_cxlMin     = input.int(0,  "Min", minval=0, maxval=59, group="HTF · Session", inline="h_cx")
+h_eodHour    = input.int(15, "EOD Flat — Hour", minval=0, maxval=23, group="HTF · Session", inline="h_eod")
+h_eodMin     = input.int(30, "Min", minval=0, maxval=59, group="HTF · Session", inline="h_eod", tooltip="Flat at the close of the candle containing this time (exactly 15:30 on a 30-minute chart).")
+h_skipThu    = input.bool(false, "Skip Thursdays", group="HTF · Session")
+h_w1LongCxlH = input.int(11, "Cancel Unfilled LONG Orders — Hour", minval=0, maxval=23, group="HTF · Session", inline="h_lc")
+h_w1LongCxlM = input.int(0,  "Min", minval=0, maxval=59, group="HTF · Session", inline="h_lc", tooltip="v3.3. Window 1 only. 10:00 = long orders are cancelled when the 10:00 candle opens, so longs only fill 08:00-09:59 (10:00 longs won 2 of 17). Shorts keep the normal cancel time above.")
+
+// ───────────── v3.3 Extra setup windows ─────────────
+h_useW2   = input.bool(true, "Window 2 (afternoon)", group="HTF · Extra Windows")
+h_w2StH   = input.int(13, "W2 First Setup Candle — Hour", minval=0, maxval=23, group="HTF · Extra Windows", inline="h_w2a")
+h_w2StM   = input.int(0,  "Min", minval=0, maxval=59, group="HTF · Extra Windows", inline="h_w2a")
+h_w2LsH   = input.int(14, "W2 Last Setup Time — Hour", minval=0, maxval=23, group="HTF · Extra Windows", inline="h_w2b")
+h_w2LsM   = input.int(0,  "Min", minval=0, maxval=59, group="HTF · Extra Windows", inline="h_w2b", tooltip="A candle must CLOSE by this time to set up a trade. 13:00-14:00 = the 13:00 candle (1-hour chart) sets up a 14:00 entry.")
+h_w2CxH   = input.int(15, "W2 Cancel Unfilled Orders — Hour", minval=0, maxval=23, group="HTF · Extra Windows", inline="h_w2c")
+h_w2CxM   = input.int(0,  "Min", minval=0, maxval=59, group="HTF · Extra Windows", inline="h_w2c")
+h_w2Dir   = input.string("Both", "W2 Direction", options=["Both", "Longs only", "Shorts only"], group="HTF · Extra Windows")
+h_useW3   = input.bool(true, "Window 3 (overnight)", group="HTF · Extra Windows")
+h_w3StH   = input.int(1, "W3 First Setup Candle — Hour", minval=0, maxval=23, group="HTF · Extra Windows", inline="h_w3a")
+h_w3StM   = input.int(0, "Min", minval=0, maxval=59, group="HTF · Extra Windows", inline="h_w3a")
+h_w3LsH   = input.int(2, "W3 Last Setup Time — Hour", minval=0, maxval=23, group="HTF · Extra Windows", inline="h_w3b")
+h_w3LsM   = input.int(0, "Min", minval=0, maxval=59, group="HTF · Extra Windows", inline="h_w3b")
+h_w3CxH   = input.int(3, "W3 Cancel Unfilled Orders — Hour", minval=0, maxval=23, group="HTF · Extra Windows", inline="h_w3c")
+h_w3CxM   = input.int(0, "Min", minval=0, maxval=59, group="HTF · Extra Windows", inline="h_w3c")
+h_w3Dir   = input.string("Longs only", "W3 Direction", options=["Both", "Longs only", "Shorts only"], group="HTF · Extra Windows", tooltip="02:00 shorts lost money (-$1,605); longs made +$5,950.")
+
+// ───────────── Filters / risk ─────────────
+h_dirFilter  = input.string("Both", "Direction", options=["Both", "Shorts only", "Longs only"], group="HTF · Risk")
+h_qty        = input.int(2, "Contracts", minval=1, group="HTF · Risk")
+h_stopBuffer = input.int(1, "Stop Buffer (ticks beyond entry candle wick)", minval=0, group="HTF · Risk")
+h_maxStopPts = input.float(10, "Max Stop Size (points, 0 = off)", minval=0, step=0.25, group="HTF · Risk", tooltip="Skip setups whose entry-to-stop distance is larger than this.")
+h_minRoomTicks = input.int(10, "Min Distance Entry -> Target (ticks)", minval=0, group="HTF · Risk")
+h_beTrigPts  = input.float(10, "Breakeven Trigger (points, 0 = off)", minval=0, step=0.25, group="HTF · Risk", tooltip="Once the trade has been this far in profit, the stop moves to entry + the lock below.")
+h_beLockTicks = input.int(1, "Breakeven Lock (ticks past entry)", minval=0, group="HTF · Risk")
+h_beMode     = input.string("Intrabar (as soon as price reaches it)", "Breakeven Timing", options=["Intrabar (as soon as price reaches it)", "Candle close (original)"], group="HTF · Risk", tooltip="v3. Intrabar: the moment price reaches the trigger, inside the candle (including the fill candle), the stop moves to entry + lock. From there it trails price at the trigger distance (10 pts by default), so it only ever tightens. Candle close (original): checked only at the close of candles AFTER the fill candle — 25 losers in the last year were +10 pts and still lost. Use Bar Detalization: High in the Strategy Tester for realistic intrabar fills.")
+
+// ───────────── Market regime ─────────────
+h_regimeMode   = input.string("With-trend only on trending days", "Market Regime Filter", options=["Off", "Skip trending days", "With-trend only on trending days", "Springboard on trending days"], group="HTF · Market Regime", tooltip="Uses COMPLETED daily candles only (nothing from today), so it never repaints. 'Skip' = no new setups on trending days. 'With-trend only' = only setups in the trend's direction. 'Springboard' = see the Springboard group.")
+h_regimeMethod = input.string("Overnight zone stair-step", "Trend Measure", options=["% change", "Efficiency ratio", "Overnight zone stair-step"], group="HTF · Market Regime", tooltip="'% change' = how far the daily close moved over the lookback, in %. 'Efficiency ratio' = net move / total distance travelled over the lookback (0 = pure chop, 1 = straight line). 'Overnight zone stair-step' = compare today's overnight zone (yesterday's 2 pm POC -> today's 6 am POC) with the previous one: OVERLAPPING = balance (normal day); STACKED clear above = uptrend day, clear below = downtrend day. Decided when the 6 am POC finishes, before the first setup candle.")
+h_stairTolTicks = input.int(0, "Stair-step: Overlap Tolerance (ticks)", minval=0, maxval=40, group="HTF · Market Regime", tooltip="Zones that miss each other by no more than this many ticks still count as overlapping.")
+h_regimeLen    = input.int(3, "Lookback (daily candles)", minval=2, maxval=100, group="HTF · Market Regime")
+h_regimePct    = input.float(3.0, "Trending if % change >", minval=0.1, step=0.1, group="HTF · Market Regime", tooltip="From the 21-month export: skipping days with a 20-day move above 3% kept $68.7k of 2026's profit vs $24.8k unfiltered, and cut its drawdown from -$47.6k to -$11.9k.")
+h_regimeER     = input.float(0.20, "Trending if efficiency ratio >", minval=0.01, maxval=1, step=0.01, group="HTF · Market Regime")
+h_showRegimeBg = input.bool(true, "Tint Trending Days", group="HTF · Market Regime", tooltip="Red = trending day trading normally (yesterday's 10 am POC was swept). Green = springboard day. Gray = trending day still waiting for the 08:30 review.")
+h_regimeBgCol  = input.color(color.new(color.red, 92), "Trending Day Tint", group="HTF · Market Regime")
+
+// ───────────── Springboard (trending days) ─────────────
+h_revStartH  = input.int(14, "Review From — Hour (previous day)", minval=0, maxval=23, group="HTF · Springboard", inline="h_rs")
+h_revStartM  = input.int(0,  "Min", minval=0, maxval=59, group="HTF · Springboard", inline="h_rs")
+h_revEndH    = input.int(8,  "Review To — Hour", minval=0, maxval=23, group="HTF · Springboard", inline="h_re")
+h_revEndM    = input.int(30, "Min", minval=0, maxval=59, group="HTF · Springboard", inline="h_re", tooltip="From 14:00 yesterday to 08:30 today: if price never traded through yesterday's 10 am POC, today is a SPRINGBOARD day. If it did, today trades normally. Until 08:30 decides, a trending day takes no new setups (unless the sweep already happened, which makes it normal right away).")
+h_springRR   = input.float(2.0, "Springboard Target (R multiple)", minval=0.25, step=0.25, group="HTF · Springboard", tooltip="Target = entry + this many times the stop distance, in the trend direction. Breakeven and EOD still apply.")
+h_maxSpring  = input.int(2, "Max Springboard Trades per Day", minval=1, maxval=10, group="HTF · Springboard")
+h_springBgCol = input.color(color.new(color.green, 90), "Springboard Day Tint", group="HTF · Springboard")
+h_waitBgCol   = input.color(color.new(color.gray, 90),  "Waiting-for-Review Tint", group="HTF · Springboard")
+
+// ───────────── Display ─────────────
+h_showPocDot    = input.bool(true, "Dot on Each Candle's POC", group="HTF · Display")
+h_pocColor      = input.color(color.new(#ffe100, 0), "POC Dot Colour", group="HTF · Display")
+h_showSetupIn   = input.bool(true, "Show Entry / Stop Lines", group="HTF · Display")
+h_showSetup     = h_showSetupIn and not h_hideSignals
+h_entryCol      = input.color(color.new(color.yellow, 0), "Entry Line", group="HTF · Display", inline="h_sl")
+h_stopCol       = input.color(color.new(color.red, 0),    "Stop Line",  group="HTF · Display", inline="h_sl")
+h_showTradeTextIn = input.bool(true, "Show Entry/Exit Text", group="HTF · Display")
+h_showTradeText   = h_showTradeTextIn and not h_hideSignals
+
+// ───────────── Data ─────────────
+[h_iClose, h_iVolume] = request.security_lower_tf(syminfo.tickerid, h_lowerTF, [close, volume])
+h_rowH = h_rowTicks * syminfo.mintick
+
+// ───────────── Time helpers ─────────────
+h_todayAt(int h_h, int h_m) =>
+    timestamp(h_keyTz, year(time, h_keyTz), month(time, h_keyTz), dayofmonth(time, h_keyTz), h_h, h_m)
+
+h_tStart = h_todayAt(h_startHour, h_startMin)
+h_tLast  = h_todayAt(h_lastHour, h_lastMin)
+h_tCxl   = h_todayAt(h_cxlHour, h_cxlMin)
+h_tEod   = h_todayAt(h_eodHour, h_eodMin)
+h_isThu  = dayofweek(time, h_keyTz) == dayofweek.thursday
+h_okDay  = not (h_skipThu and h_isThu)
+
+// ───────────── Market regime (completed daily candles only — no repaint) ─────────────
+h_dailyRegime() =>
+    h_netMove = close - close[h_regimeLen]
+    h_path    = math.sum(math.abs(close - close[1]), h_regimeLen)
+    h_pct     = h_netMove / close[h_regimeLen] * 100
+    h_er      = h_path > 0 ? math.abs(h_netMove) / h_path : 0.0
+    [h_pct[1], h_er[1]]     // [1] + lookahead_on = yesterday's completed daily values only
+[h_dPct, h_dER] = request.security(syminfo.tickerid, "D", h_dailyRegime(), lookahead=barmerge.lookahead_on)
+// Overnight stair-step state (updated when the 6 am POC finishes, further down)
+var int   h_stairDir  = 0       // 1 = stacked above previous overnight zone, -1 = below, 0 = overlapping
+var float h_prevOnTop = na
+var float h_prevOnBot = na
+var array<float> h_onWidths = array.new<float>(0)   // last 20 overnight zone widths
+var float h_onWidthRatio = na                       // today's overnight width / prior 20-day average
+var float h_open7 = na                              // open of the 07:00 candle
+h_t7 = h_todayAt(7, 0)
+if timeframe.isintraday and not na(time_close) and time <= h_t7 and h_t7 < time_close
+    h_open7 := open
+h_useStair   = h_regimeMethod == "Overnight zone stair-step"
+h_trendDir   = h_useStair ? h_stairDir : nz(h_dPct) >= 0 ? 1 : -1
+h_isTrending = h_useStair ? h_stairDir != 0 : na(h_dPct) ? false : h_regimeMethod == "% change" ? math.abs(h_dPct) > h_regimePct : h_dER > h_regimeER
+h_regimeAllows(int h_d) =>
+    h_regimeMode == "Off" or h_regimeMode == "Springboard on trending days" or not h_isTrending or (h_regimeMode == "With-trend only on trending days" and h_d == h_trendDir)
+h_useSpringMode = h_regimeMode == "Springboard on trending days" and h_isTrending
+h_tRevStart = h_todayAt(h_revStartH, h_revStartM)
+h_tRevEnd   = h_todayAt(h_revEndH, h_revEndM)
+
+h_intraday = timeframe.isintraday and not na(time_close)
+// v3.3: three setup windows. Window 1 = the Session group; 2 and 3 = Extra Windows.
+var int h_setWin = 0            // window the current (unfilled) setup came from
+h_w2S = h_todayAt(h_w2StH, h_w2StM)
+h_w2L = h_todayAt(h_w2LsH, h_w2LsM)
+h_w2C = h_todayAt(h_w2CxH, h_w2CxM)
+h_w3S = h_todayAt(h_w3StH, h_w3StM)
+h_w3L = h_todayAt(h_w3LsH, h_w3LsM)
+h_w3C = h_todayAt(h_w3CxH, h_w3CxM)
+h_tLongCxl = h_todayAt(h_w1LongCxlH, h_w1LongCxlM)
+h_inW1 = h_intraday and time >= h_tStart and time_close <= h_tLast and h_okDay
+h_inW2 = h_useW2 and h_intraday and time >= h_w2S and time_close <= h_w2L and h_okDay
+h_inW3 = h_useW3 and h_intraday and time >= h_w3S and time_close <= h_w3L and h_okDay
+h_inSetupWindow = h_inW1 or h_inW2 or h_inW3
+h_curWin = h_inW1 ? 1 : h_inW2 ? 2 : h_inW3 ? 3 : 0
+h_dirAllowed(string h_m, int h_d) => h_m == "Both" or (h_m == "Longs only" and h_d == 1) or (h_m == "Shorts only" and h_d == -1)
+// Window 1 longs: no setup whose order would still be resting at the long cancel time
+h_winDirOk(int h_d) => h_curWin == 1 ? (h_d == -1 or time_close < h_tLongCxl) : h_curWin == 2 ? h_dirAllowed(h_w2Dir, h_d) : h_curWin == 3 ? h_dirAllowed(h_w3Dir, h_d) : false
+// >= so nothing can fill in the candle AFTER the cancel time
+h_pastCancel = h_intraday and (h_setWin == 1 ? (time_close >= h_tCxl and time >= h_tStart) : h_setWin == 2 ? (time_close >= h_w2C and time >= h_w2S) : h_setWin == 3 ? (time_close >= h_w3C and time >= h_w3S) : false)
+// EOD candle: the one containing EOD, or any later candle the same calendar day (early close / holiday).
+h_isEodBar      = h_intraday and time_close >= h_tEod and time >= h_tStart
+h_newDay        = timeframe.change("D")
+
+// ───────────── Zone POC built over a time window (can span several chart candles) ─────────────
+// Buckets are fixed price rows (rowTicks), keyed by row number, so several candles add up.
+var map<int, float> h_zMap1 = map.new<int, float>()
+var map<int, float> h_zMap2 = map.new<int, float>()
+var map<int, float> h_zMap3 = map.new<int, float>()
+var int h_zStart1 = na
+var int h_zStart2 = na
+var int h_zStart3 = na
+
+h_accumulate(map<int, float> h_m) =>
+    for h_k = 0 to array.size(h_iClose) - 1
+        h_key = int(math.floor(array.get(h_iClose, h_k) / h_rowH))
+        h_m.put(h_key, nz(h_m.get(h_key)) + array.get(h_iVolume, h_k))
+
+h_pocFromMap(map<int, float> h_m) =>
+    float h_best = -1.0
+    int h_bestKey = na
+    for [h_key, h_v] in h_m
+        if h_v > h_best
+            h_best := h_v
+            h_bestKey := h_key
+    na(h_bestKey) ? na : math.round_to_mintick((h_bestKey + 0.5) * h_rowH)
+
+// ───────────── Key lines (two days, recoloured on roll) ─────────────
+var array<line> h_key1Lines = array.new<line>(0)
+var array<line> h_key2Lines = array.new<line>(0)
+var array<line> h_key3Lines = array.new<line>(0)
+
+h_addKey(array<line> h_arr, int h_t0, float h_price, color h_newCol, color h_oldCol) =>
+    if array.size(h_arr) >= 2
+        line.delete(array.shift(h_arr))
+    if array.size(h_arr) >= 1
+        line.set_color(array.get(h_arr, array.size(h_arr) - 1), h_oldCol)
+    array.push(h_arr, line.new(h_t0, h_price, time_close, h_price, xloc=xloc.bar_time, extend=extend.right, color=h_newCol, width=h_keyWidth, style=line.style_solid))
+
+// ───────────── State ─────────────
+var float h_pocSeries = na
+var float h_zoneA     = na      // latest 10 am POC
+var float h_zoneB     = na      // latest 2 pm POC
+var float h_zoneC     = na      // latest 6 am POC (secondary zone = 2 pm -> 6 am)
+
+var int   h_setDir    = 0       // 1 long, -1 short, 0 none
+var float h_setEntry  = na
+var float h_setStop   = na
+var bool  h_setFilled = false
+var int   h_setCount  = 0
+var int   h_fillBar   = na
+var float h_bestPx    = na      // best price since the candle after the fill
+var bool  h_beOn      = false
+var line  h_entryLn   = na
+var line  h_stopLn    = na
+var bool  h_setSpring = false   // current setup is a springboard trade
+var float h_setTarget = na      // springboard / trend-flip target (R multiple); na = zone target
+var bool  h_setFlip   = false   // current setup is a v3.1 trend-flip long
+var int   h_springToday = 0
+
+// Springboard review (yesterday 14:00 -> today 08:30): was yesterday's 10 am POC swept?
+var bool  h_revActive = false
+var float h_revRef    = na
+var bool  h_revSwept  = false
+var int   h_dayMode   = 0       // 0 = undecided, 1 = normal, 2 = springboard
+var int   h_springDir = 0       // short-term trend: 1 = price held ABOVE yesterday's 10 am POC (long), -1 = below (short)
+
+h_endSetupLines() =>
+    if not na(h_entryLn)
+        line.set_extend(h_entryLn, extend.none)
+        line.set_x2(h_entryLn, time)
+    if not na(h_stopLn)
+        line.set_extend(h_stopLn, extend.none)
+        line.set_x2(h_stopLn, time)
+
+h_zoneKnown = not na(h_zoneA) and not na(h_zoneB)
+h_zoneTop   = h_zoneKnown ? math.max(h_zoneA, h_zoneB) : na
+h_zoneBot   = h_zoneKnown ? math.min(h_zoneA, h_zoneB) : na
+
+h_slTxt = h_beOn ? "HTF BE" : "HTF SL Wick"
+
+// ───────────── Intrabar breakeven (v3) ─────────────
+// A trailing stop that switches on when price reaches entry +/- trigger. Its first level is
+// entry + lock (trailing distance = trigger - lock), then it follows price at that distance.
+// Sent with every exit order, alongside the fixed stop and the zone target.
+h_beIntrabar   = h_beMode == "Intrabar (as soon as price reaches it)" and h_beTrigPts > 0
+h_beTrailTicks = math.max(1, int(math.round(h_beTrigPts / syminfo.mintick)) - h_beLockTicks)
+h_beTrailPx(int h_d, float h_e) => h_beIntrabar and not na(h_e) ? h_e + h_d * h_beTrigPts : na
+h_beTrailOff = h_beIntrabar ? h_beTrailTicks : na
+h_beTrailTxt = h_showTradeText ? "HTF BE Trail" : ""
+
+// ───────────── Exits — live zone target + current stop, re-sent every bar ─────────────
+if h_enableTrading and h_setDir == 1
+    strategy.exit("H Long Exit", from_entry="H Long", limit=not na(h_setTarget) ? h_setTarget : h_zoneTop, stop=h_setStop, trail_price=h_beTrailPx(1, h_setEntry), trail_offset=h_beTrailOff, comment_profit=h_showTradeText ? (h_setSpring ? "HTF Spring TP" : h_setFlip ? "HTF Trend TP" : "HTF Zone High") : "", comment_loss=h_showTradeText ? h_slTxt : "", comment_trailing=h_beTrailTxt)
+if h_enableTrading and h_setDir == -1
+    strategy.exit("H Short Exit", from_entry="H Short", limit=not na(h_setTarget) ? h_setTarget : h_zoneBot, stop=h_setStop, trail_price=h_beTrailPx(-1, h_setEntry), trail_offset=h_beTrailOff, comment_profit=h_showTradeText ? (h_setSpring ? "HTF Spring TP" : "HTF Zone Low") : "", comment_loss=h_showTradeText ? h_slTxt : "", comment_trailing=h_beTrailTxt)
+
+// ───────────── Overnight context tags (analysis only — no effect on trades) ─────────────
+//  6: where today's 6 am POC sits vs the NY zone (latest 10 am & 2 pm POCs): A above / I inside / B below
+//  W: overnight zone (2 pm -> 6 am) width vs its 20-day average: T tight (<0.75x) / N normal / W wide (>1.25x),
+//     plus direction: + = overnight moved UP (6 am POC above 2 pm POC), - = moved DOWN (e.g. W:W- = wide drop)
+//  O: 07:00 open vs the overnight zone: A above / I inside / B below
+//  S: overnight stair-step vs yesterday: U stacked up / D stacked down / O overlapping
+h_onTagStr() =>
+    string h_r = ""
+    if h_tagOvernight and not na(h_zoneA) and not na(h_zoneB) and not na(h_zoneC)
+        h_nyTop = math.max(h_zoneA, h_zoneB)
+        h_nyBot = math.min(h_zoneA, h_zoneB)
+        h_onT   = math.max(h_zoneB, h_zoneC)
+        h_onB   = math.min(h_zoneB, h_zoneC)
+        h_t6 = h_zoneC > h_nyTop ? "A" : h_zoneC < h_nyBot ? "B" : "I"
+        h_tw = na(h_onWidthRatio) ? "?" : h_onWidthRatio < 0.75 ? "T" : h_onWidthRatio > 1.25 ? "W" : "N"
+        h_tw := h_tw + (h_zoneC > h_zoneB ? "+" : h_zoneC < h_zoneB ? "-" : "=")   // + overnight moved UP (6 am POC above 2 pm POC), - moved DOWN
+        h_tOpen = na(h_open7) ? "?" : h_open7 > h_onT ? "A" : h_open7 < h_onB ? "B" : "I"
+        h_ts = h_stairDir == 1 ? "U" : h_stairDir == -1 ? "D" : "O"
+        h_r := " | 6:" + h_t6 + " W:" + h_tw + " O:" + h_tOpen + " S:" + h_ts
+    h_r
+
+// Same 6: and O: definitions as the tags, evaluated whether or not tagging is on (used by the v3 filter)
+h_sixPosTag() =>
+    not na(h_zoneA) and not na(h_zoneB) and not na(h_zoneC) ? (h_zoneC > math.max(h_zoneA, h_zoneB) ? "A" : h_zoneC < math.min(h_zoneA, h_zoneB) ? "B" : "I") : "?"
+h_openPosTag() =>
+    not na(h_zoneB) and not na(h_zoneC) and not na(h_open7) ? (h_open7 > math.max(h_zoneB, h_zoneC) ? "A" : h_open7 < math.min(h_zoneB, h_zoneC) ? "B" : "I") : "?"
+
+// Overnight width class + direction (same definitions as the W tag)
+h_onKnown  = not na(h_zoneB) and not na(h_zoneC)
+h_onWClass = na(h_onWidthRatio) ? "?" : h_onWidthRatio < 0.75 ? "T" : h_onWidthRatio > 1.25 ? "W" : "N"
+h_onSgn    = not h_onKnown ? 0 : h_zoneC > h_zoneB ? 1 : h_zoneC < h_zoneB ? -1 : 0
+// d = trade direction (1 long, -1 short)
+h_isWideDropLong(int h_d) => h_skipWideDropLongs and h_onKnown and h_d == 1 and h_onWClass == "W" and h_onSgn == -1
+h_isBelowInsideLong(int h_d) => h_skipBelowInsideLongs and h_d == 1 and h_sixPosTag() == "B" and h_openPosTag() == "I"
+h_isNormalLong(int h_d) => h_skipNormalLongs and h_onKnown and h_d == 1 and h_onWClass == "N"
+h_longRuleSkip(int h_d) => h_isWideDropLong(h_d) or h_isBelowInsideLong(h_d) or h_isNormalLong(h_d)
+// v3.1: a SHORT setup (candle closed above the zone) after a normal-width overnight rally with the open above the overnight zone
+h_isNOASetup(int h_setupDir) => h_setupDir == -1 and h_onKnown and h_onWClass == "N" and h_onSgn == 1 and h_openPosTag() == "A"
+h_isNOASkip(int h_setupDir) => h_noaMode == "Skip (no trade)" and h_isNOASetup(h_setupDir)
+h_isTrendFlip(int h_setupDir) => h_noaMode == "Trade long with the trend" and h_setupDir == -1 and h_onKnown and h_onWClass == "N" and h_onSgn == 1 and h_openPosTag() == "A"
+h_isStrong(int h_d) => h_sizeStrong and h_onKnown and ((h_d == -1 and h_onWClass == "W" and h_onSgn == 1) or (h_d == 1 and h_onWClass == "T" and h_onSgn == -1))
+h_entryQty(int h_d) => h_isStrong(h_d) ? h_strongQty : h_qty
+h_sizeTag(int h_d) => h_isStrong(h_d) ? " SZ" + str.tostring(h_strongQty) : ""
+
+// ───────────── Once per closed candle ─────────────
+if barstate.isconfirmed
+    h_n = array.size(h_iClose)
+    // COMBINED: the Flip took priority on the last candle -> drop our cancelled setup
+    if g_hKill
+        h_endSetupLines()
+        h_setDir := 0
+        g_hKill := false
+
+    // ── Zone POCs: accumulate over the window, finalise on the candle that closes it ──
+    if h_n > 0
+        h_t1 = h_todayAt(h_k1Hour, h_k1Min)
+        h_e1 = h_t1 + h_zoneLenMin * 60000
+        if h_intraday and time < h_e1 and time_close > h_t1
+            if na(h_zStart1) or h_zStart1 != h_t1
+                h_zMap1.clear()
+                h_zStart1 := h_t1
+            h_accumulate(h_zMap1)
+            if time_close >= h_e1
+                h_p = h_pocFromMap(h_zMap1)
+                if not na(h_p)
+                    h_zoneA := h_p
+                    if h_showKey
+                        h_addKey(h_key1Lines, h_t1, h_p, h_k1NewCol, h_k1OldCol)
+        h_t2 = h_todayAt(h_k2Hour, h_k2Min)
+        h_e2 = h_t2 + h_zoneLenMin * 60000
+        if h_intraday and time < h_e2 and time_close > h_t2
+            if na(h_zStart2) or h_zStart2 != h_t2
+                h_zMap2.clear()
+                h_zStart2 := h_t2
+            h_accumulate(h_zMap2)
+            if time_close >= h_e2
+                h_p = h_pocFromMap(h_zMap2)
+                if not na(h_p)
+                    h_zoneB := h_p
+                    if h_showKey
+                        h_addKey(h_key2Lines, h_t2, h_p, h_k2NewCol, h_k2OldCol)
+        h_t3 = h_todayAt(h_k3Hour, h_k3Min)
+        h_e3 = h_t3 + h_zoneLenMin * 60000
+        if h_intraday and time < h_e3 and time_close > h_t3
+            if na(h_zStart3) or h_zStart3 != h_t3
+                h_zMap3.clear()
+                h_zStart3 := h_t3
+            h_accumulate(h_zMap3)
+            if time_close >= h_e3
+                h_p = h_pocFromMap(h_zMap3)
+                if not na(h_p)
+                    h_zoneC := h_p
+                    // Overnight zone = yesterday's 2 pm POC -> today's 6 am POC. Overlap vs stair-step.
+                    if not na(h_zoneB)
+                        h_onTop = math.max(h_zoneB, h_p)
+                        h_onBot = math.min(h_zoneB, h_p)
+                        h_tol   = h_stairTolTicks * syminfo.mintick
+                        if not na(h_prevOnTop)
+                            h_overlaps = h_onBot <= h_prevOnTop + h_tol and h_onTop >= h_prevOnBot - h_tol
+                            h_stairDir := h_overlaps ? 0 : h_onBot > h_prevOnTop ? 1 : -1
+                        h_prevOnTop := h_onTop
+                        h_prevOnBot := h_onBot
+                        // Overnight width vs its recent average (for the W tag)
+                        h_wNow = h_onTop - h_onBot
+                        h_onWidthRatio := array.size(h_onWidths) >= 5 and array.avg(h_onWidths) > 0 ? h_wNow / array.avg(h_onWidths) : na
+                        array.push(h_onWidths, h_wNow)
+                        if array.size(h_onWidths) > 20
+                            array.shift(h_onWidths)
+                    if h_showZone2
+                        h_addKey(h_key3Lines, h_t3, h_p, h_k3NewCol, h_k3OldCol)
+
+    // ── Springboard review: yesterday 14:00 -> today 08:30, did price trade through yesterday's 10 am POC? ──
+    if h_newDay
+        h_dayMode := 0
+        h_springToday := 0
+    if h_intraday and time <= h_tRevStart and h_tRevStart < time_close
+        h_revActive := true
+        h_revRef    := h_zoneA            // the 10 am POC that just printed today = "yesterday's" for tomorrow
+        h_revSwept  := na(h_zoneA)        // no reference yet -> treat as swept (normal)
+    if h_revActive and not na(h_revRef) and low <= h_revRef and high >= h_revRef
+        h_revSwept := true
+    if h_revActive and h_intraday and time_close >= h_tRevEnd and time < h_tRevStart
+        h_revActive := false
+        h_dayMode   := h_revSwept ? 1 : 2
+        // Unswept all night, so price stayed on one side: POC below price -> longs, above -> shorts.
+        h_springDir := na(h_revRef) ? 0 : close > h_revRef ? 1 : -1
+
+    // ── This candle's own POC ──
+    float h_pocPrice = na
+    if h_n > 0 and (high - low) > 0
+        h_numRows = int(math.min(h_maxRows, math.max(1, math.ceil((high - low) / h_rowH))))
+        h_rowH2   = (high - low) / h_numRows
+        h_bins = array.new_float(h_numRows, 0.0)
+        for h_k = 0 to h_n - 1
+            h_idx = int(math.max(0, math.min(h_numRows - 1, math.floor((array.get(h_iClose, h_k) - low) / h_rowH2))))
+            array.set(h_bins, h_idx, array.get(h_bins, h_idx) + array.get(h_iVolume, h_k))
+        h_pocIdx   = array.indexof(h_bins, array.max(h_bins))
+        h_pocPrice := math.round_to_mintick(low + (h_pocIdx + 0.5) * h_rowH2)
+        h_pocSeries := h_pocPrice
+
+    h_zKnown = not na(h_zoneA) and not na(h_zoneB)
+    h_zTop   = h_zKnown ? math.max(h_zoneA, h_zoneB) : na
+    h_zBot   = h_zKnown ? math.min(h_zoneA, h_zoneB) : na
+
+    // ── Lifecycle: fill / close / stop-before-fill / breakeven ──
+    if h_setDir != 0
+        // COMBINED: a trade count rise that belongs to the Flip means our resting order was cancelled (OCA)
+        if not h_setFilled and (strategy.closedtrades + strategy.opentrades) > h_setCount and not str.startswith(g_lastId, "H ")
+            strategy.cancel("H Long")
+            strategy.cancel("H Short")
+            h_endSetupLines()
+            h_setDir := 0
+            h_setCount := strategy.closedtrades + strategy.opentrades
+        if h_enableTrading and not h_setFilled and (strategy.closedtrades + strategy.opentrades) > h_setCount
+            h_setFilled := true
+            h_fillBar   := bar_index
+            if h_setSpring
+                h_springToday += 1
+        if h_setFilled and g_hPos == 0
+            h_endSetupLines()
+            h_setDir := 0
+            h_setFilled := false
+        else if h_setFilled
+            // Breakeven at candle close: only candles AFTER the fill candle count (their whole range is in-trade).
+            // In Intrabar mode the trailing exit has already done this inside the candle; this keeps the
+            // fixed stop and the chart line in step with it.
+            if bar_index > h_fillBar
+                h_bestPx := na(h_bestPx) ? (h_setDir == 1 ? high : low) : (h_setDir == 1 ? math.max(h_bestPx, high) : math.min(h_bestPx, low))
+                if h_beTrigPts > 0 and not h_beOn and math.abs(h_bestPx - h_setEntry) >= h_beTrigPts and (h_setDir == 1 ? h_bestPx > h_setEntry : h_bestPx < h_setEntry)
+                    h_beOn    := true
+                    h_setStop := h_setDir == 1 ? h_setEntry + h_beLockTicks * syminfo.mintick : h_setEntry - h_beLockTicks * syminfo.mintick
+                    if not na(h_stopLn)
+                        line.set_extend(h_stopLn, extend.none)
+                        line.set_x2(h_stopLn, time_close)
+                    if h_showSetup
+                        h_stopLn := line.new(time_close, h_setStop, time_close + 1, h_setStop, xloc=xloc.bar_time, extend=extend.right, color=color.new(color.aqua, 0), width=2)
+        else if not h_setSpring
+            if h_setDir == 1 ? low <= h_setStop : high >= h_setStop
+                strategy.cancel("H Long")
+                strategy.cancel("H Short")
+                h_endSetupLines()
+                h_setDir := 0
+
+    // ── Cancel unfilled orders after the cancel time ──
+    h_longCxlNow = h_setWin == 1 and h_setDir == 1 and h_intraday and time_close >= h_tLongCxl and time >= h_tStart
+    if h_setDir != 0 and not h_setFilled and (h_pastCancel or h_longCxlNow)
+        strategy.cancel("H Long")
+        strategy.cancel("H Short")
+        h_endSetupLines()
+        h_setDir := 0
+
+    // ── EOD (or a missed EOD on an early close): flat, cancel, no new setups ──
+    // session.islastbar catches early closes (Jul 3, Labor Day...) so nothing is held over a holiday.
+    if h_isEodBar or session.islastbar or (h_newDay and g_hPos != 0)
+        if h_enableTrading and g_hPos != 0
+            strategy.close_all(comment=h_showTradeText ? "HTF EOD" : "", immediately=true)
+        strategy.cancel("H Long")
+        strategy.cancel("H Short")
+        if h_setDir != 0
+            h_endSetupLines()
+        h_setDir := 0
+        h_setFilled := false
+
+    // ── New setup: candle closed OUTSIDE the zone -> trade toward it from this candle's POC ──
+    // ── SPRINGBOARD day: rest an order at the zone edge in the trend direction ──
+    // Uptrend: buy at the zone TOP (limit if price is above it = tap-in, stop if
+    // inside/below = exit up through it). Downtrend: sell at the zone BOTTOM.
+    // Stop = far side of the zone + buffer (capped by Max Stop Size). Target = R multiple.
+    else if h_inW1 and h_zKnown and h_useSpringMode and h_dayMode == 2 and h_springDir != 0
+        h_sDir    = h_springDir
+        h_sDirOk  = h_dirFilter == "Both" or (h_dirFilter == "Shorts only" and h_sDir == -1) or (h_dirFilter == "Longs only" and h_sDir == 1)
+        h_canPlace = g_flat and h_springToday < h_maxSpring and (h_setDir == 0 or (h_setSpring and not h_setFilled))
+        if h_sDirOk and h_canPlace and not h_longRuleSkip(h_sDir) and c_okHTF(h_sDir) and e_entryOK
+            h_sEntry = h_sDir == 1 ? h_zTop : h_zBot
+            h_sStop  = h_sDir == 1 ? h_zBot - h_stopBuffer * syminfo.mintick : h_zTop + h_stopBuffer * syminfo.mintick
+            if h_maxStopPts > 0 and math.abs(h_sEntry - h_sStop) > h_maxStopPts
+                h_sStop := h_sEntry - h_sDir * h_maxStopPts
+            h_sTarget = h_sEntry + h_sDir * h_springRR * math.abs(h_sEntry - h_sStop)
+            h_isNew   = h_setDir == 0
+            strategy.cancel("H Long")
+            strategy.cancel("H Short")
+            h_setDir    := h_sDir
+            h_setEntry  := h_sEntry
+            h_setStop   := h_sStop
+            h_setTarget := h_sTarget
+            h_setSpring := true
+            h_setFlip   := false
+            h_setWin    := 1
+            h_setFilled := false
+            if h_isNew
+                g_hNew   := true
+                h_setCount := strategy.closedtrades + strategy.opentrades
+                h_fillBar  := na
+                h_bestPx   := na
+                h_beOn     := false
+            if h_showSetup
+                if h_isNew or na(h_entryLn)
+                    h_entryLn := line.new(time, h_setEntry, time_close, h_setEntry, xloc=xloc.bar_time, extend=extend.right, color=color.new(color.lime, 0), width=2)
+                    h_stopLn  := line.new(time, h_setStop,  time_close, h_setStop,  xloc=xloc.bar_time, extend=extend.right, color=h_stopCol, width=2)
+                else
+                    line.set_y1(h_entryLn, h_setEntry)
+                    line.set_y2(h_entryLn, h_setEntry)
+                    line.set_y1(h_stopLn, h_setStop)
+                    line.set_y2(h_stopLn, h_setStop)
+            if h_enableTrading
+                if h_sDir == 1
+                    if close > h_sEntry
+                        strategy.entry("H Long", strategy.long, qty=h_entryQty(h_sDir), limit=h_sEntry, comment=h_showTradeText ? "HTF Spring Long" + h_onTagStr() + h_sizeTag(h_sDir) : "", oca_name="ENTRY", oca_type=strategy.oca.cancel)
+                    else
+                        strategy.entry("H Long", strategy.long, qty=h_entryQty(h_sDir), stop=h_sEntry, comment=h_showTradeText ? "HTF Spring Long" + h_onTagStr() + h_sizeTag(h_sDir) : "", oca_name="ENTRY", oca_type=strategy.oca.cancel)
+                    strategy.exit("H Long Exit", from_entry="H Long", limit=h_sTarget, stop=h_sStop, trail_price=h_beTrailPx(1, h_sEntry), trail_offset=h_beTrailOff, comment_profit=h_showTradeText ? "HTF Spring TP" : "", comment_loss=h_showTradeText ? "HTF SL Zone" : "", comment_trailing=h_beTrailTxt)
+                else
+                    if close < h_sEntry
+                        strategy.entry("H Short", strategy.short, qty=h_entryQty(h_sDir), limit=h_sEntry, comment=h_showTradeText ? "HTF Spring Short" + h_onTagStr() + h_sizeTag(h_sDir) : "", oca_name="ENTRY", oca_type=strategy.oca.cancel)
+                    else
+                        strategy.entry("H Short", strategy.short, qty=h_entryQty(h_sDir), stop=h_sEntry, comment=h_showTradeText ? "HTF Spring Short" + h_onTagStr() + h_sizeTag(h_sDir) : "", oca_name="ENTRY", oca_type=strategy.oca.cancel)
+                    strategy.exit("H Short Exit", from_entry="H Short", limit=h_sTarget, stop=h_sStop, trail_price=h_beTrailPx(-1, h_sEntry), trail_offset=h_beTrailOff, comment_profit=h_showTradeText ? "HTF Spring TP" : "", comment_loss=h_showTradeText ? "HTF SL Zone" : "", comment_trailing=h_beTrailTxt)
+
+    // ── NORMAL behaviour (non-trending days, or trending days where the 10 am POC was swept) ──
+    else if h_inSetupWindow and h_zKnown and not na(h_pocPrice) and g_flat and (not h_useSpringMode or h_dayMode == 1 or (h_dayMode == 0 and h_revActive and h_revSwept))
+        int h_dir = close > h_zTop ? -1 : close < h_zBot ? 1 : 0                // setup side: toward the zone
+        h_flip    = h_dir != 0 and h_isTrendFlip(h_dir)                            // v3.1: W:N+ O:A short -> long with the trend
+        int h_tDir = h_flip ? 1 : h_dir                                          // direction actually traded
+        h_dirOk   = h_dirFilter == "Both" or (h_dirFilter == "Shorts only" and h_tDir == -1) or (h_dirFilter == "Longs only" and h_tDir == 1)
+        h_replaceOk = h_setDir == 0 or (not h_setFilled and h_tDir != 0 and h_tDir != h_setDir)
+        h_stopPx  = h_tDir == -1 ? high + h_stopBuffer * syminfo.mintick : low - h_stopBuffer * syminfo.mintick
+        h_room    = h_dir == -1 ? h_pocPrice - h_zBot : h_dir == 1 ? h_zTop - h_pocPrice : 0.0
+        h_roomOk  = h_flip or h_room >= h_minRoomTicks * syminfo.mintick           // trend longs target an R multiple, not the zone
+        h_regimeOk = h_regimeAllows(h_tDir)
+        h_stopOk  = h_maxStopPts == 0 or math.abs(h_stopPx - h_pocPrice) <= h_maxStopPts
+        h_riskOk  = math.abs(h_stopPx - h_pocPrice) > 0
+        h_rulesOk = h_flip or not h_longRuleSkip(h_tDir)
+        h_six     = h_sixPosTag()
+        h_tagOk   = not (h_skipInsideLongs and h_tDir == 1 and h_six == "I") and not (h_skipBelowShorts and h_tDir == -1 and h_six == "B")
+        if h_tDir != 0 and h_winDirOk(h_tDir) and h_tagOk and not h_isNOASkip(h_dir) and h_dirOk and h_regimeOk and h_replaceOk and h_stopOk and h_riskOk and h_rulesOk and h_roomOk and c_okHTF(h_tDir) and e_entryOK
+            strategy.cancel("H Long")
+            strategy.cancel("H Short")
+            h_endSetupLines()
+            h_setDir    := h_tDir
+            g_hNew    := true           // COMBINED: HTF set up a new trade on this candle
+            h_setEntry  := h_pocPrice
+            h_setStop   := h_stopPx
+            h_setFilled := false
+            h_setSpring := false
+            h_setFlip   := h_flip
+            h_setWin    := h_curWin
+            h_setTarget := h_flip ? h_pocPrice + h_flipRR * math.abs(h_pocPrice - h_stopPx) : na
+            h_setCount  := strategy.closedtrades + strategy.opentrades
+            h_fillBar   := na
+            h_bestPx    := na
+            h_beOn      := false
+            if h_showSetup
+                h_entryLn := line.new(time, h_setEntry, time_close, h_setEntry, xloc=xloc.bar_time, extend=extend.right, color=h_flip ? color.new(color.lime, 0) : h_entryCol, width=2)
+                if h_showTagLabels and h_tagOvernight and not h_hideSignals
+                    h_tg = h_onTagStr()
+                    if str.length(h_tg) > 0
+                        label.new(time, h_setEntry, (h_flip ? "TREND " : "") + str.replace(h_tg, " | ", ""), xloc=xloc.bar_time, style=label.style_label_right, size=size.small, textcolor=color.white, color=color.new(h_flip ? color.green : color.purple, 20))
+                h_stopLn  := line.new(time, h_setStop,  time_close, h_setStop,  xloc=xloc.bar_time, extend=extend.right, color=h_stopCol,  width=2)
+            if h_enableTrading
+                if h_tDir == -1
+                    if close <= h_setEntry
+                        strategy.entry("H Short", strategy.short, qty=h_entryQty(h_tDir), limit=h_setEntry, comment=h_showTradeText ? "HTF Zone Short" + h_onTagStr() + h_sizeTag(h_tDir) : "", oca_name="ENTRY", oca_type=strategy.oca.cancel)
+                    else
+                        strategy.entry("H Short", strategy.short, qty=h_entryQty(h_tDir), stop=h_setEntry, comment=h_showTradeText ? "HTF Zone Short" + h_onTagStr() + h_sizeTag(h_tDir) : "", oca_name="ENTRY", oca_type=strategy.oca.cancel)
+                    strategy.exit("H Short Exit", from_entry="H Short", limit=h_zBot, stop=h_setStop, trail_price=h_beTrailPx(-1, h_setEntry), trail_offset=h_beTrailOff, comment_profit=h_showTradeText ? "HTF Zone Low" : "", comment_loss=h_showTradeText ? "HTF SL Wick" : "", comment_trailing=h_beTrailTxt)
+                else
+                    h_lName = h_flip ? "HTF Trend Long" : "HTF Zone Long"
+                    h_lTgt  = h_flip ? h_setTarget : h_zTop
+                    if close >= h_setEntry
+                        strategy.entry("H Long", strategy.long, qty=h_entryQty(h_tDir), limit=h_setEntry, comment=h_showTradeText ? h_lName + h_onTagStr() + h_sizeTag(h_tDir) : "", oca_name="ENTRY", oca_type=strategy.oca.cancel)
+                    else
+                        strategy.entry("H Long", strategy.long, qty=h_entryQty(h_tDir), stop=h_setEntry, comment=h_showTradeText ? h_lName + h_onTagStr() + h_sizeTag(h_tDir) : "", oca_name="ENTRY", oca_type=strategy.oca.cancel)
+                    strategy.exit("H Long Exit", from_entry="H Long", limit=h_lTgt, stop=h_setStop, trail_price=h_beTrailPx(1, h_setEntry), trail_offset=h_beTrailOff, comment_profit=h_showTradeText ? (h_flip ? "HTF Trend TP" : "HTF Zone High") : "", comment_loss=h_showTradeText ? "HTF SL Wick" : "", comment_trailing=h_beTrailTxt)
+
+// ───────────── Plots ─────────────
+h_pTop = plot(h_showZone ? h_zoneTop : na, title="Zone Top", color=na, style=plot.style_stepline, editable=false)
+h_pBot = plot(h_showZone ? h_zoneBot : na, title="Zone Bottom", color=na, style=plot.style_stepline, editable=false)
+fill(h_pTop, h_pBot, color=h_zoneCol, title="10 am / 2 pm POC Zone")
+h_zone2Known = not na(h_zoneB) and not na(h_zoneC)
+h_pTop2 = plot(h_showZone2 and h_zone2Known ? math.max(h_zoneB, h_zoneC) : na, title="Secondary Zone Top", color=na, style=plot.style_stepline, editable=false)
+h_pBot2 = plot(h_showZone2 and h_zone2Known ? math.min(h_zoneB, h_zoneC) : na, title="Secondary Zone Bottom", color=na, style=plot.style_stepline, editable=false)
+fill(h_pTop2, h_pBot2, color=h_zone2Col, title="2 pm / 6 am POC Zone")
+plot(h_showPocDot ? h_pocSeries : na, title="POC Dot", color=h_pocColor, style=plot.style_circles, linewidth=3)
+h_springState = h_useSpringMode ? (h_dayMode == 2 ? 2 : h_dayMode == 1 or (h_revActive and h_revSwept) ? 1 : 0) : (h_isTrending ? 1 : -1)
+h_bgColNow = not h_showRegimeBg or h_regimeMode == "Off" or not timeframe.isintraday or h_springState == -1 ? color(na) : h_springState == 2 ? h_springBgCol : h_springState == 0 ? h_waitBgCol : h_regimeBgCol
+bgcolor(h_bgColNow, title="Trending / Springboard Day")
+
+
+// ═════════════════════════ 4HR FLIP ENGINE ═════════════════════════
+
+// ═════════════════════════════════════════════════════════════════════════
+// 4HR FLIP — strategy v14 (Oct 5, 2026), built for the 1-hour ES/MES chart.
+//
+//  v14: FIX of v13. v13 wrongly locked the Stop to "Beyond the sweep candle";
+//   the baseline uses "Beyond the zone edge". The Stop setting is back on the
+//   panel. All DEFAULTS now equal the locked baseline, so after pasting use
+//   Defaults -> Reset Settings to load them in one click: Days Back 2, Max 2
+//   trades/session, no candle timeout, sweep must close back inside, cancel
+//   15:00, flat 15:30, overnight trades flat 09:00 (entries 18:00-09:00),
+//   blocks 13:00-18:00 and 20:00-02:00, stop beyond the zone edge + 5 ticks,
+//   max stop 20 pts, breakeven 15 pts / +8 ticks, trend-day hold on
+//   (previous-session zones), trend measure = efficiency ratio > 0.30 over
+//   20 days.
+//  v13: LOCKED BASELINE. Settings for features that are not in use were taken
+//   off the settings panel. Their input lines are commented out ("[v13 removed
+//   from panel]") with a fixed value right under each, so the code is
+//   unchanged and anything can be restored by uncommenting one line.
+//   Locked off: entry window, longs-overnight-only, trailing stop, profit
+//   target (exit at the 09:00 / 15:30 flats), hold-with-trend-only, 2 pm lines.
+//   Locked values: stop beyond the sweep candle, 2 pm / 6 am POC window 60 min.
+//   Baseline result (Oct 2025 - Oct 2026, 1H ES, 2 contracts): $82,925 closed,
+//   PF 2.14, 42.6% wins, max drawdown -$10,460, 155 trades.
+//  v12: LONGS OVERNIGHT ONLY (Trading group, OFF by default — switch on to test).
+//   No long entry can fill in the day session (default 09:00-18:00); long
+//   orders still waiting are cancelled when it starts. Shorts and overnight
+//   longs are unchanged. (Last test: day longs 40 trades, +$8.3k, PF 1.40.)
+//   Defaults updated to the current baseline: Days Back 2, Block B 20:00-02:00,
+//   Max Stop 20 pts, Target none (exit at the flats), Breakeven 15 pts / +8 ticks.
+//  v11: BUG FIX — the v9/v10 breakeven stop never switched on (the first
+//   position was never registered, so the stop was never moved). Fixed.
+//   No other changes from v10.
+//  v10: TREND-DAY HOLD (group "Market Regime"), using the HTF Corridor regime.
+//   On a TREND DAY, once in a trade, sweeps of PREVIOUS-SESSION zones (D-1 and
+//   older) are ignored: no reversal, no "Reverse" exit. The trade stays on
+//   until one of the other exits fires: stop, breakeven, target, trail (if
+//   on), the 09:00 overnight flat or the 15:30 EOD flat. Today's zone (D-0)
+//   can still reverse the trade (switchable: "All zones").
+//   Trend day = Overnight zone stair-step (default, same as HTF Corridor):
+//   today's overnight zone (yesterday's 2 pm POC -> today's 6 am POC) sits
+//   fully above (uptrend) or below (downtrend) yesterday's overnight zone.
+//   Overlapping = balance day, the rule is off. Decided when the 6 am candle
+//   closes and kept until the next morning's 6 am candle (so it covers the
+//   evening/overnight session that follows). "% change" and "Efficiency ratio"
+//   (completed daily candles only) are also available.
+//   Trend days are tinted on the chart (green up / red down, switchable).
+//  v9: BREAKEVEN STOP (Risk group, ON by default). Once a trade has been
+//   "Breakeven Trigger" points in profit (default 25), the stop moves to the
+//   entry price + "BE+ Ticks" (default 1 tick) and stays there until the
+//   trade hits it ("BE" exit), the target, or the 09:00 / 15:30 flat.
+//   Checked at each candle close, so the stop moves from the next candle on
+//   (no guessing about the order of prices inside a 1-hour candle).
+//   The trailing stop is still available and still OFF by default.
+//  THE ZONE = a previous trading day's 10:00 candle: its high, low and POC.
+//  v8: (1) BLOCKED ENTRY HOURS (Trading group): two switchable windows where
+//   no new entry can fill — Block A 13:00-18:00 (on), Block B 20:00-01:00 (on).
+//   A sweep is skipped if the next candle (where the entry would fill) opens
+//   inside a block, and any order still waiting is cancelled when a block
+//   starts. (2) TRAILING STOP (Risk group, OFF by default): once a trade is
+//   up "Trail Trigger" points, a stop trails "Trail Distance" points behind
+//   the best price ("Trail" exit). The normal stop stays in place until then.
+//  v7: TWO FLAT TIMES (Trading group). A trade ENTERED overnight (default
+//   18:00-09:00) is flattened at 09:00 ("ON Flat"). Trades entered during the
+//   day keep the regular 15:30 flat ("EOD"). Both times, and the overnight
+//   entry window, are settings; the overnight flat can be switched off.
+//  v6: REVERSE ON AN OPPOSITE SIGNAL (Trading group). While in a trade, a
+//   sweep that signals the OTHER direction closes the open trade and enters
+//   the new one — by default at market on the next candle's open ("Reverse"
+//   exit, then "Rev Long"/"Rev Short"). Same-direction sweeps while in a trade
+//   are ignored. The window, the 15:00-18:00 block and max trades still apply.
+//  v5: (1) a zone is only used up when its order FILLS — an unfilled,
+//   cancelled order leaves the zone live for the next sweep; (2) a new sweep
+//   replaces an order that is still waiting to fill; (3) fills/cancels are
+//   handled before the sweep check each candle; (4) 2 pm lines OFF by default.
+//  v4: ANY HOUR. Every 10:00 candle becomes a sweep zone the moment it
+//   closes (today's = D-0) and stays live for "Days Back" trading days after
+//   that (default 3 -> today + the 3 previous days). Sweeps are checked on
+//   every candle, overnight included, except 15:00-18:00 (orders cancelled at
+//   15:00, flat at 15:30, nothing new until the 18:00 session open).
+//   A zone is retired once it has been swept into a trade. Optional entry
+//   window, max trades per day and an unfilled-order timeout to refine later.
+//   (The v1-v3 "inside day" trigger is not in v4.)
+//  v3: the 10:00 zones of the last N days are SWEEP ZONES whether or not
+//   today's 10:00 candle is inside them ("Require Today's 10:00 Inside the
+//   Zone" is now OFF by default; switch it on for the v1/v2 inside-day rule).
+//   Sweeps are watched from the close of today's 10:00 candle.
+//  v2 DAYS BACK (Trading group): 1-5, default 2.
+//   "Any of the last N days" (default): today's 10:00 candle is tested against
+//     each of the last N days' 10:00 candles; every one it sits inside is
+//     armed. The first sweep of any armed zone takes the trade (nearest day
+//     first if two are swept on the same candle).
+//   "Exactly N days back": only the 10:00 candle from N trading days ago.
+//
+//  TRIGGER 1 (inside day)
+//   At the close of TODAY's 10:00 candle: its high AND low are both inside
+//   the previous day's 10:00 candle range -> the setup is ARMED.
+//
+//  SWEEP
+//   A later candle trades beyond one edge of the zone and CLOSES BACK INSIDE
+//   it (switchable: "Sweep Must Close Back Inside").
+//
+//  ENTRY — against the sweep, at the previous day's 10:00 POC
+//   Swept the LOW  -> LONG  at the zone POC
+//   Swept the HIGH -> SHORT at the zone POC
+//   If price is already past the POC in the trade's direction, a limit order
+//   waits for the pullback to it; otherwise a stop order catches the move
+//   back through it. One trade per day.
+//
+//  DEFAULT RISK (not in the original rule — all adjustable)
+//   Stop:   beyond the sweep candle's extreme + 1 tick.
+//   Target: the opposite edge of the zone (long -> zone high).
+//   Orders cancelled if not filled by 15:00; flat at 15:30.
+//
+//  Also draws (all switchable): each candle's POC + value area, and the
+//  10 am / 2 pm candle highs and lows that run until crossed.
+// ═════════════════════════════════════════════════════════════════════════
+
+// ───────────── Trading ─────────────
+f_enableTradingIn = input.bool(true, "Enable Trading", group="FLIP · Trading")
+f_hideSignals     = g_hideAll or input.bool(false, "Hide All Trade Signals (for recording)", group="FLIP · Trading", tooltip="One switch for clean screen recordings: no orders, no trade arrows, no setup labels or entry lines. The levels stay on the chart.")
+f_enableTrading   = f_enableTradingIn and not f_hideSignals
+f_qty             = input.int(2, "Contracts", minval=1, group="FLIP · Trading")
+f_dirFilter       = input.string("Both", "Direction", options=["Both", "Longs only", "Shorts only"], group="FLIP · Trading")
+f_keyTz           = input.string("America/New_York", "Time Zone", group="FLIP · Trading")
+f_zoneHour        = input.int(10, "Zone Candle — Hour", minval=0, maxval=23, group="FLIP · Trading", inline="f_zc")
+f_zoneMin         = input.int(0,  "Min", minval=0, maxval=59, group="FLIP · Trading", inline="f_zc", tooltip="The candle that defines the zone (previous day) and the inside-day test (today).")
+f_daysBack        = input.int(2, "Days Back (0-5)", minval=0, maxval=5, group="FLIP · Trading", tooltip="v4. A 10:00 zone stays live from its own close through this many further trading days. 0 = today's 10:00 zone only (D-0). 3 = D-0 to D-3.")
+// [v13 removed from panel] useWindow       = input.bool(false, "Only Enter Inside the Window Below", group="FLIP · Trading", tooltip="v4: OFF = any hour (except the 15:00-18:00 block). Turn on to refine entry hours after the first test.")
+f_useWindow       = false   // v13: locked (not used) — to restore, uncomment the line above and delete this one
+// [v13 removed from panel] winStartH       = input.int(18, "Window Start — Hour", minval=0, maxval=23, group="FLIP · Trading", inline="f_w1")
+f_winStartH       = 18   // v13: locked (not used) — to restore, uncomment the line above and delete this one
+// [v13 removed from panel] winStartM       = input.int(0,  "Min", minval=0, maxval=59, group="FLIP · Trading", inline="f_w1")
+f_winStartM       = 0   // v13: locked (not used) — to restore, uncomment the line above and delete this one
+// [v13 removed from panel] winEndH         = input.int(15, "Window End — Hour", minval=0, maxval=23, group="FLIP · Trading", inline="f_w2")
+f_winEndH         = 15   // v13: locked (not used) — to restore, uncomment the line above and delete this one
+// [v13 removed from panel] winEndM         = input.int(0,  "Min", minval=0, maxval=59, group="FLIP · Trading", inline="f_w2", tooltip="The window can wrap past midnight (e.g. 18:00 -> 15:00).")
+f_winEndM         = 0   // v13: locked (not used) — to restore, uncomment the line above and delete this one
+f_useReverse      = input.bool(true, "Reverse on an Opposite Signal", group="FLIP · Trading", tooltip="v6. In a trade and a sweep signals the other direction -> exit and enter the new trade.")
+f_revEntry        = input.string("Market (next candle open)", "Reversal Entry", options=["Market (next candle open)", "At the zone POC"], group="FLIP · Trading", tooltip="Market = flip right away. At the zone POC = exit now and rest the new entry at that zone's POC like a normal setup.")
+f_maxPerDay       = input.int(2, "Max Trades per Session (0 = no limit)", minval=0, maxval=20, group="FLIP · Trading")
+f_cxlBars         = input.int(0, "Cancel an Unfilled Order After (candles, 0 = off)", minval=0, maxval=24, group="FLIP · Trading", tooltip="With any-hour entries an order placed overnight could otherwise rest for many hours.")
+f_needClose       = input.bool(true, "Sweep Must Close Back Inside the Zone", group="FLIP · Trading", tooltip="On = the sweep candle's wick goes past the zone edge but it closes back inside. Off = trading past the edge is enough.")
+f_cutHour         = input.int(15, "Cancel Unfilled Orders — Hour", minval=0, maxval=23, group="FLIP · Trading", inline="f_ct")
+f_cutMin          = input.int(0,  "Min", minval=0, maxval=59, group="FLIP · Trading", inline="f_ct", tooltip="Resting orders are cancelled at this time; no new setups from here until the 18:00 session open.")
+f_eodHour         = input.int(15, "Flat At — Hour", minval=0, maxval=23, group="FLIP · Trading", inline="f_eod")
+f_eodMin          = input.int(30, "Min", minval=0, maxval=59, group="FLIP · Trading", inline="f_eod", tooltip="Day trades (and anything still open) are flat at this time.")
+f_useOnFlat       = input.bool(true, "Separate Flat Time for Overnight Trades", group="FLIP · Trading", tooltip="v7. A trade whose ENTRY filled inside the overnight window below is flattened at the overnight flat time. Off = every trade uses the regular Flat At time.")
+f_onFlatHour      = input.int(9, "Overnight Trades Flat At — Hour", minval=0, maxval=23, group="FLIP · Trading", inline="f_onf")
+f_onFlatMin       = input.int(0, "Min", minval=0, maxval=59, group="FLIP · Trading", inline="f_onf")
+f_onStartH        = input.int(18, "Overnight Entries From — Hour", minval=0, maxval=23, group="FLIP · Trading", inline="f_ons")
+f_onStartM        = input.int(0,  "Min", minval=0, maxval=59, group="FLIP · Trading", inline="f_ons")
+f_onEndH          = input.int(9,  "Overnight Entries Until — Hour", minval=0, maxval=23, group="FLIP · Trading", inline="f_one")
+f_onEndM          = input.int(0,  "Min", minval=0, maxval=59, group="FLIP · Trading", inline="f_one", tooltip="An entry filled at or after From and before Until counts as an overnight trade (wraps past midnight). Entries from Until onward are day trades.")
+f_useBlockA       = input.bool(true, "Block Entries — Window A", group="FLIP · Trading", tooltip="v8. No entry fills inside this window. Default 13:00-18:00 (the 13:00-15:00 entries lost money in the test).")
+f_blkAStartH      = input.int(13, "Block A From — Hour", minval=0, maxval=23, group="FLIP · Trading", inline="f_ba1")
+f_blkAStartM      = input.int(0,  "Min", minval=0, maxval=59, group="FLIP · Trading", inline="f_ba1")
+f_blkAEndH        = input.int(18, "Block A Until — Hour", minval=0, maxval=23, group="FLIP · Trading", inline="f_ba2")
+f_blkAEndM        = input.int(0,  "Min", minval=0, maxval=59, group="FLIP · Trading", inline="f_ba2")
+f_useBlockB       = input.bool(true, "Block Entries — Window B", group="FLIP · Trading", tooltip="v8. Default 20:00-01:00 (the 20:00-00:00 entries lost money in the test). Can wrap past midnight.")
+f_blkBStartH      = input.int(20, "Block B From — Hour", minval=0, maxval=23, group="FLIP · Trading", inline="f_bb1")
+f_blkBStartM      = input.int(0,  "Min", minval=0, maxval=59, group="FLIP · Trading", inline="f_bb1")
+f_blkBEndH        = input.int(2,  "Block B Until — Hour", minval=0, maxval=23, group="FLIP · Trading", inline="f_bb2")
+f_blkBEndM        = input.int(0,  "Min", minval=0, maxval=59, group="FLIP · Trading", inline="f_bb2")
+// [v13 removed from panel] longsONOnly     = input.bool(false, "Longs: Overnight Only", group="FLIP · Trading", tooltip="v12. On = no long entry can fill during the day session below; long orders still waiting are cancelled when it starts. Shorts and overnight longs unchanged.")
+f_longsONOnly     = false   // v13: locked (not used) — to restore, uncomment the line above and delete this one
+// [v13 removed from panel] dayLStartH      = input.int(9,  "Day Session (no longs) From — Hour", minval=0, maxval=23, group="FLIP · Trading", inline="f_dl1")
+f_dayLStartH      = 9   // v13: locked (not used) — to restore, uncomment the line above and delete this one
+// [v13 removed from panel] dayLStartM      = input.int(0,  "Min", minval=0, maxval=59, group="FLIP · Trading", inline="f_dl1")
+f_dayLStartM      = 0   // v13: locked (not used) — to restore, uncomment the line above and delete this one
+// [v13 removed from panel] dayLEndH        = input.int(18, "Day Session (no longs) Until — Hour", minval=0, maxval=23, group="FLIP · Trading", inline="f_dl2")
+f_dayLEndH        = 18   // v13: locked (not used) — to restore, uncomment the line above and delete this one
+// [v13 removed from panel] dayLEndM        = input.int(0,  "Min", minval=0, maxval=59, group="FLIP · Trading", inline="f_dl2")
+f_dayLEndM        = 0   // v13: locked (not used) — to restore, uncomment the line above and delete this one
+
+// ───────────── Risk ─────────────
+f_stopMode   = input.string("Beyond the zone edge", "Stop", options=["Beyond the sweep candle", "Beyond the zone edge", "Fixed ticks"], group="FLIP · Risk")
+f_stopBuf    = input.int(3, "Stop Buffer (ticks)", minval=0, group="FLIP · Risk")
+// [v13 removed from panel] stopTicks  = input.int(40, "Fixed Stop (ticks)", minval=1, group="FLIP · Risk", tooltip="Used by 'Fixed ticks'. 40 ticks = 10 points on ES.")
+f_stopTicks  = 40   // v13: locked (not used) — to restore, uncomment the line above and delete this one
+f_maxStopPts = input.float(20, "Max Stop (points, 0 = off)", minval=0, step=0.25, group="FLIP · Risk", tooltip="Skip the trade if the stop would be further than this from the entry.")
+// [v13 removed from panel] tgtMode    = input.string("None (exit at EOD)", "Target", options=["Opposite zone edge", "R multiple", "None (exit at EOD)"], group="FLIP · Risk")
+f_tgtMode    = "None (exit at EOD)"   // v13: locked (not used) — to restore, uncomment the line above and delete this one
+// [v13 removed from panel] tgtR       = input.float(2.0, "Target (R multiple)", minval=0.25, step=0.25, group="FLIP · Risk")
+f_tgtR       = 2.0   // v13: locked (not used) — to restore, uncomment the line above and delete this one
+// [v13 removed from panel] useTrail   = input.bool(false, "Trailing Stop", group="FLIP · Risk", tooltip="v8. Off by default so the blocked hours can be tested on their own first.")
+f_useTrail   = false   // v13: locked (not used) — to restore, uncomment the line above and delete this one
+// [v13 removed from panel] trailTrig  = input.float(15, "Trail Trigger (points in profit)", minval=0.25, step=0.25, group="FLIP · Risk", tooltip="The trail switches on once the trade is this many points in profit (from the fill price).")
+f_trailTrig  = 15.0   // v13: locked (not used) — to restore, uncomment the line above and delete this one
+f_useBE      = input.bool(true, "Breakeven Stop", group="FLIP · Risk", tooltip="v9. Once the trade has been the trigger distance in profit, the stop moves to entry + BE+ ticks. Checked at each candle close.")
+f_beTrig     = input.float(15, "Breakeven Trigger (points in profit)", minval=0.25, step=0.25, group="FLIP · Risk", tooltip="How far the trade must go in your favor (from the fill price, best high/low since entry) before the stop moves.")
+f_beTicks    = input.int(8, "BE+ Ticks", minval=0, maxval=40, group="FLIP · Risk", tooltip="Where the moved stop sits: entry + this many ticks in your favor. 0 = exact entry price. 1 tick = 0.25 point.")
+// [v13 removed from panel] trailDist  = input.float(10, "Trail Distance (points)", minval=0.25, step=0.25, group="FLIP · Risk", tooltip="Once on, the stop follows this many points behind the best price reached. 10 points = $1,000 on 2 ES contracts.")
+f_trailDist  = 10.0   // v13: locked (not used) — to restore, uncomment the line above and delete this one
+
+// ───────────── Market Regime (v10) ─────────────
+f_useTrendHold  = input.bool(true, "Trend Day: Hold Trades Through Opposite Sweeps", group="FLIP · Market Regime", tooltip="v10. On a trend day, while in a trade, opposite sweeps of the zones below are ignored — no reversal, no 'Reverse' exit. The trade stays on until the stop, breakeven, target, trail, 09:00 overnight flat or 15:30 EOD flat fires.")
+f_holdScope     = input.string("Previous-session zones (D-1 and older)", "Zones Ignored While in a Trade", options=["Previous-session zones (D-1 and older)", "All zones (D-0 too)"], group="FLIP · Market Regime", tooltip="Previous-session = today's 10:00 zone (D-0) can still reverse the trade. All zones = no reversals at all on trend days.")
+// [v13 removed from panel] holdWithTrend = input.bool(false, "Only Hold Trades That Are With the Trend", group="FLIP · Market Regime", tooltip="On = the hold only applies when the open trade is in the trend's direction (long on an uptrend day, short on a downtrend day). Off = any trade on a trend day.")
+f_holdWithTrend = false   // v13: locked (not used) — to restore, uncomment the line above and delete this one
+f_regimeMethod  = input.string("Efficiency ratio", "Trend Measure", options=["Overnight zone stair-step", "% change", "Efficiency ratio"], group="FLIP · Market Regime", tooltip="Same measures as HTF Corridor. Stair-step: today's overnight zone (yesterday's 2 pm POC -> today's 6 am POC) vs yesterday's. Overlapping = balance; stacked above = uptrend day; below = downtrend day. % change / Efficiency ratio use completed daily candles only (no repaint).")
+f_stairTolTicks = input.int(3, "Stair-step: Overlap Tolerance (ticks)", minval=0, maxval=40, group="FLIP · Market Regime")
+// [v13 removed from panel] regPocLen     = input.int(60, "2 pm / 6 am POC Window (minutes)", minval=1, maxval=240, group="FLIP · Market Regime", tooltip="60 on the 1-hour chart = the 14:00 and 06:00 candles' own POC.")
+f_regPocLen     = 60   // v13: locked (not used) — to restore, uncomment the line above and delete this one
+f_regimeLen     = input.int(20, "Lookback (daily candles)", minval=2, maxval=100, group="FLIP · Market Regime", tooltip="For % change / Efficiency ratio.")
+f_regimePct     = input.float(3.0, "Trending if % change >", minval=0.1, step=0.1, group="FLIP · Market Regime")
+f_regimeER      = input.float(0.30, "Trending if efficiency ratio >", minval=0.01, maxval=1, step=0.01, group="FLIP · Market Regime")
+f_showRegimeBg  = input.bool(true, "Tint Trend Days", group="FLIP · Market Regime")
+f_upBgCol       = input.color(color.new(color.green, 92), "Uptrend Day", group="FLIP · Market Regime", inline="f_rb")
+f_dnBgCol       = input.color(color.new(color.red, 92), "Downtrend Day", group="FLIP · Market Regime", inline="f_rb")
+
+// ───────────── Display ─────────────
+f_showZone   = input.bool(true, "Shade the Previous Day's 10 am Zone", group="FLIP · Display")
+f_zoneCol    = input.color(color.new(color.yellow, 85), "Zone", group="FLIP · Display", inline="f_zn")
+f_zPocCol    = input.color(color.new(color.lime, 0), "Zone POC", group="FLIP · Display", inline="f_zn")
+f_showPoc    = input.bool(true, "Candle POC Dots", group="FLIP · Display", inline="f_p")
+f_pocCol     = input.color(color.new(#ffe100, 0), "", group="FLIP · Display", inline="f_p")
+f_showVA     = input.bool(true, "Candle VAH / VAL Marks", group="FLIP · Display", inline="f_v")
+f_vahCol     = input.color(color.new(color.aqua, 0), "VAH", group="FLIP · Display", inline="f_v")
+f_valCol     = input.color(color.new(color.fuchsia, 0), "VAL", group="FLIP · Display", inline="f_v")
+f_showVABox  = input.bool(true, "Shade Each Candle's Value Area", group="FLIP · Display")
+f_vaBoxCol   = input.color(color.new(color.gray, 80), "Shading", group="FLIP · Display")
+f_showKey    = input.bool(true, "10 am Candle High & Low Lines (until crossed)", group="FLIP · Display")
+// [v13 removed from panel] showK2     = input.bool(false, "Also Draw the 2 pm Candle Lines", group="FLIP · Display", tooltip="v5: off — focusing on the 10 am zones.")
+f_showK2     = false   // v13: locked (not used) — to restore, uncomment the line above and delete this one
+// [v13 removed from panel] k2Hour     = input.int(14, "Second Candle — Hour", minval=0, maxval=23, group="FLIP · Display")
+f_k2Hour     = 14   // v13: locked (not used) — to restore, uncomment the line above and delete this one
+f_k1Col      = input.color(color.white,  "10 am Lines", group="FLIP · Display", inline="f_kc")
+// [v13 removed from panel] k2Col      = input.color(color.yellow, "2 pm Lines",  group="FLIP · Display", inline="f_kc")
+f_k2Col      = color.yellow   // v13: locked (not used) — to restore, uncomment the line above and delete this one
+f_keepCrossed = input.bool(true, "Keep Crossed Lines", group="FLIP · Display")
+
+// ───────────── Candle profile ─────────────
+f_lowerTF  = input.timeframe("1", "Intrabar Resolution", group="FLIP · Candle Profile", tooltip="1 = 1-minute closes. Use 5 for a longer backtest history.")
+f_rowTicks = input.int(4, "Row Size (ticks)", minval=1, group="FLIP · Candle Profile")
+f_vaPct    = input.float(70, "Value Area %", minval=10, maxval=99, step=1, group="FLIP · Candle Profile")
+
+[f_iClose, f_iVolume] = request.security_lower_tf(syminfo.tickerid, f_lowerTF, [close, volume])
+f_rowH = f_rowTicks * syminfo.mintick
+
+f_candleProfile() =>
+    float f_poc = na
+    float f_vah = na
+    float f_val = na
+    f_n = array.size(f_iClose)
+    if f_n > 0 and high > low
+        f_lo   = int(math.floor(low / f_rowH))
+        f_hi   = int(math.floor(high / f_rowH))
+        f_rows = math.min(f_hi - f_lo + 1, 1000)
+        f_bins = array.new_float(f_rows, 0.0)
+        float f_tot = 0.0
+        for f_k = 0 to f_n - 1
+            f_idx = int(math.max(0, math.min(f_rows - 1, math.floor(array.get(f_iClose, f_k) / f_rowH) - f_lo)))
+            f_v = array.get(f_iVolume, f_k)
+            array.set(f_bins, f_idx, array.get(f_bins, f_idx) + f_v)
+            f_tot += f_v
+        if f_tot > 0
+            f_pi = array.indexof(f_bins, array.max(f_bins))
+            float f_acc = array.get(f_bins, f_pi)
+            int f_a = f_pi
+            int f_b = f_pi
+            f_tgt = f_tot * f_vaPct / 100
+            while f_acc < f_tgt and (f_a > 0 or f_b < f_rows - 1)
+                f_up = f_b < f_rows - 1 ? array.get(f_bins, f_b + 1) : -1.0
+                f_dn = f_a > 0 ? array.get(f_bins, f_a - 1) : -1.0
+                if f_up >= f_dn
+                    f_b += 1
+                    f_acc += f_up
+                else
+                    f_a -= 1
+                    f_acc += f_dn
+            f_poc := math.round_to_mintick(math.min(high, math.max(low, (f_lo + f_pi + 0.5) * f_rowH)))
+            f_vah := math.round_to_mintick(math.min(high, (f_lo + f_b + 1) * f_rowH))
+            f_val := math.round_to_mintick(math.max(low, (f_lo + f_a) * f_rowH))
+    [f_poc, f_vah, f_val]
+
+[f_cPoc, f_cVah, f_cVal] = f_candleProfile()
+
+// ───────────── Time ─────────────
+f_todayAt(int f_h, int f_m) => timestamp(f_keyTz, year(time, f_keyTz), month(time, f_keyTz), dayofmonth(time, f_keyTz), f_h, f_m)
+f_intraday  = timeframe.isintraday and not na(time_close)
+f_isZoneBar = f_intraday and hour(time, f_keyTz) == f_zoneHour and minute(time, f_keyTz) == f_zoneMin
+f_isK2Bar   = f_intraday and hour(time, f_keyTz) == f_k2Hour and minute(time, f_keyTz) == 0
+f_tZoneEnd  = f_todayAt(f_zoneHour, f_zoneMin)
+f_tCut      = f_todayAt(f_cutHour, f_cutMin)
+f_tEod      = f_todayAt(f_eodHour, f_eodMin)
+f_afterZone = f_intraday and time > f_tZoneEnd                       // candles after today's 10:00 candle
+f_beforeCut = f_intraday and time_close <= f_tCut
+f_isEodBar  = f_intraday and time_close >= f_tEod and time >= f_tZoneEnd
+f_newDay    = timeframe.change("D")
+f_modOf(int f_t) => hour(f_t, f_keyTz) * 60 + minute(f_t, f_keyTz)
+f_inWin(int f_m, int f_s, int f_e) => f_s < f_e ? (f_m >= f_s and f_m < f_e) : (f_m >= f_s or f_m < f_e)
+f_cutM  = f_cutHour * 60 + f_cutMin
+f_openM = 18 * 60                                                    // ES session open
+f_inBlock(int f_m) => (f_useBlockA and f_inWin(f_m, f_blkAStartH * 60 + f_blkAStartM, f_blkAEndH * 60 + f_blkAEndM)) or (f_useBlockB and f_inWin(f_m, f_blkBStartH * 60 + f_blkBStartM, f_blkBEndH * 60 + f_blkBEndM))
+f_trPts = f_useTrail ? f_trailTrig / syminfo.mintick : na                // trail settings in ticks
+
+// ───────────── Market regime (v10, from HTF Corridor) ─────────────
+f_dailyRegime() =>
+    f_netMove = close - close[f_regimeLen]
+    f_path    = math.sum(math.abs(close - close[1]), f_regimeLen)
+    f_pct     = f_netMove / close[f_regimeLen] * 100
+    f_er      = f_path > 0 ? math.abs(f_netMove) / f_path : 0.0
+    [f_pct[1], f_er[1]]     // [1] + lookahead_on = yesterday's completed daily values only
+[f_dPct, f_dER] = request.security(syminfo.tickerid, "D", f_dailyRegime(), lookahead=barmerge.lookahead_on)
+var map<int, float> f_rMap2 = map.new<int, float>()
+var map<int, float> f_rMap6 = map.new<int, float>()
+var int   f_rStart2   = na
+var int   f_rStart6   = na
+var float f_rPoc2     = na          // latest 2 pm POC
+var float f_rPoc6     = na          // latest 6 am POC
+var int   f_stairDir  = 0           // 1 = overnight zone stacked above yesterday's, -1 = below, 0 = overlapping
+var float f_prevOnTop = na
+var float f_prevOnBot = na
+f_rowHr = f_rowTicks * syminfo.mintick
+f_rAccumulate(map<int, float> f_m) =>
+    if array.size(f_iClose) > 0
+        for f_k = 0 to array.size(f_iClose) - 1
+            f_key = int(math.floor(array.get(f_iClose, f_k) / f_rowHr))
+            f_m.put(f_key, nz(f_m.get(f_key)) + array.get(f_iVolume, f_k))
+f_rPocFromMap(map<int, float> f_m) =>
+    float f_best = -1.0
+    int f_bestKey = na
+    for [f_key, f_v] in f_m
+        if f_v > f_best
+            f_best := f_v
+            f_bestKey := f_key
+    na(f_bestKey) ? na : math.round_to_mintick((f_bestKey + 0.5) * f_rowHr)
+if barstate.isconfirmed and f_intraday
+    f_t2r = f_todayAt(14, 0)
+    f_e2r = f_t2r + f_regPocLen * 60000
+    if time < f_e2r and time_close > f_t2r
+        if na(f_rStart2) or f_rStart2 != f_t2r
+            f_rMap2.clear()
+            f_rStart2 := f_t2r
+        f_rAccumulate(f_rMap2)
+        if time_close >= f_e2r
+            f_rPoc2 := f_rPocFromMap(f_rMap2)
+    f_t6r = f_todayAt(6, 0)
+    f_e6r = f_t6r + f_regPocLen * 60000
+    if time < f_e6r and time_close > f_t6r
+        if na(f_rStart6) or f_rStart6 != f_t6r
+            f_rMap6.clear()
+            f_rStart6 := f_t6r
+        f_rAccumulate(f_rMap6)
+        if time_close >= f_e6r
+            f_p6 = f_rPocFromMap(f_rMap6)
+            if not na(f_p6)
+                f_rPoc6 := f_p6
+                if not na(f_rPoc2)                                    // overnight zone = yesterday's 2 pm POC -> today's 6 am POC
+                    f_onTop = math.max(f_rPoc2, f_p6)
+                    f_onBot = math.min(f_rPoc2, f_p6)
+                    f_tol   = f_stairTolTicks * syminfo.mintick
+                    if not na(f_prevOnTop)
+                        f_overlaps = f_onBot <= f_prevOnTop + f_tol and f_onTop >= f_prevOnBot - f_tol
+                        f_stairDir := f_overlaps ? 0 : f_onBot > f_prevOnTop ? 1 : -1
+                    f_prevOnTop := f_onTop
+                    f_prevOnBot := f_onBot
+f_useStair   = f_regimeMethod == "Overnight zone stair-step"
+f_trendDir   = f_useStair ? f_stairDir : nz(f_dPct) >= 0 ? 1 : -1
+f_isTrending = f_useStair ? f_stairDir != 0 : na(f_dPct) ? false : f_regimeMethod == "% change" ? math.abs(f_dPct) > f_regimePct : f_dER > f_regimeER
+f_trOff = f_useTrail ? f_trailDist / syminfo.mintick : na
+
+
+// ───────────── State ─────────────
+// Live zones (one per 10:00 candle), newest LAST
+var array<float> f_zHs  = array.new<float>(0)
+var array<float> f_zLs  = array.new<float>(0)
+var array<float> f_zPs  = array.new<float>(0)
+var array<int>   f_zTs  = array.new<int>(0)       // open time of the zone's 10:00 candle
+var array<int>   f_zAge = array.new<int>(0)       // trading days since it was made (0 = today)
+var array<box>   f_zBx  = array.new<box>(0)
+var array<line>  f_zLn  = array.new<line>(0)
+var bool  f_pending  = false
+var int   f_pendDir  = 0         // direction of the waiting order
+var int   f_pendBar  = na
+var int   f_pendZone = na        // zone id (its 10:00 candle time) of the resting order
+var int   f_pendCnt  = 0         // closed + open trades when the order was placed
+var int   f_tradesDay = 0
+var line  f_entryLn  = na
+var float f_lastZH = na
+var float f_lastZL = na
+var float f_lastZP = na
+var float f_curTgt  = na        // target of the most recent order (re-used when the stop moves to breakeven)
+var int   f_beBar   = na        // entry bar of the position being watched
+var float f_bestPx  = na        // best price since entry
+var bool  f_beDone  = false     // stop already moved for this position
+
+f_retireZone(int f_j) =>
+    if f_showZone
+        box.set_right(array.get(f_zBx, f_j), time_close)
+        line.set_x2(array.get(f_zLn, f_j), time_close)
+    array.remove(f_zHs, f_j), array.remove(f_zLs, f_j), array.remove(f_zPs, f_j), array.remove(f_zTs, f_j), array.remove(f_zAge, f_j), array.remove(f_zBx, f_j), array.remove(f_zLn, f_j)
+    true
+
+// ───────────── Once per closed candle ─────────────
+if barstate.isconfirmed and f_intraday
+    f_openMod  = f_modOf(time)
+    f_closeMod = f_modOf(time_close)
+
+    // ── New session: age the zones, retire the expired ones ──
+    if f_newDay
+        f_tradesDay := 0
+        if array.size(f_zHs) > 0
+            for f_j = array.size(f_zHs) - 1 to 0
+                array.set(f_zAge, f_j, array.get(f_zAge, f_j) + 1)
+                if array.get(f_zAge, f_j) > f_daysBack
+                    f_retireZone(f_j)
+
+    // ── Live zones keep extending ──
+    if f_showZone and array.size(f_zBx) > 0
+        for f_j = 0 to array.size(f_zBx) - 1
+            box.set_right(array.get(f_zBx, f_j), time_close)
+            line.set_x2(array.get(f_zLn, f_j), time_close)
+            box.set_text(array.get(f_zBx, f_j), "D-" + str.tostring(array.get(f_zAge, f_j)))
+
+    // ── COMBINED: a trade count rise that belongs to HTF means our resting order was cancelled (OCA). Zone stays live. ──
+    if f_pending and (strategy.closedtrades + strategy.opentrades) > f_pendCnt and not str.startswith(g_lastId, "F ")
+        f_pending := false
+        if not na(f_entryLn)
+            line.set_extend(f_entryLn, extend.none)
+            line.set_x2(f_entryLn, time_close)
+
+    // ── Resting order: filled? (counts fills that also exited on the same candle) ──
+    if f_pending and (strategy.closedtrades + strategy.opentrades) > f_pendCnt
+        f_pending := false
+        f_tradesDay += 1
+        // the zone is used up only now that it actually traded
+        if array.size(f_zTs) > 0
+            for f_j = array.size(f_zTs) - 1 to 0
+                if array.get(f_zTs, f_j) == f_pendZone
+                    f_retireZone(f_j)
+                    break
+        if not na(f_entryLn)
+            line.set_extend(f_entryLn, extend.none)
+            line.set_x2(f_entryLn, time_close)
+
+    // ── Resting order: cancel at the 15:00 cutoff or after cxlBars candles (zone stays live) ──
+    if f_pending and (f_inWin(f_closeMod, f_cutM, f_openM) or (f_cxlBars > 0 and bar_index - f_pendBar >= f_cxlBars))
+        strategy.cancel("F Long")
+        strategy.cancel("F Short")
+        f_pending := false
+        if not na(f_entryLn)
+            line.set_extend(f_entryLn, extend.none)
+            line.set_x2(f_entryLn, time_close)
+
+    // ── v9: breakeven stop — move the stop to entry + BE+ ticks once the trade has gone beTrig points ──
+    if f_useBE and f_enableTrading and g_fPos != 0 and strategy.opentrades > 0
+        f_pd  = g_fPos > 0 ? 1 : -1
+        f_eb  = strategy.opentrades.entry_bar_index(strategy.opentrades - 1)
+        f_ep  = strategy.opentrades.entry_price(strategy.opentrades - 1)
+        if na(f_beBar) or f_eb != f_beBar                                 // new position: start watching
+            f_beBar  := f_eb
+            f_beDone := false
+            f_bestPx := bar_index == f_eb ? close : (f_pd == 1 ? high : low)  // entry candle: only its close counts
+        else
+            f_bestPx := na(f_bestPx) ? (f_pd == 1 ? high : low) : f_pd == 1 ? math.max(f_bestPx, high) : math.min(f_bestPx, low)
+        if not f_beDone and f_pd * (f_bestPx - f_ep) >= f_beTrig
+            f_bePx = f_ep + f_pd * f_beTicks * syminfo.mintick
+            if f_pd == 1
+                strategy.exit("F Long Exit", from_entry="F Long", stop=f_bePx, limit=f_curTgt, trail_points=f_trPts, trail_offset=f_trOff, comment_loss="FLIP BE", comment_profit="FLIP TP", comment_trailing="FLIP Trail")
+            else
+                strategy.exit("F Short Exit", from_entry="F Short", stop=f_bePx, limit=f_curTgt, trail_points=f_trPts, trail_offset=f_trOff, comment_loss="FLIP BE", comment_profit="FLIP TP", comment_trailing="FLIP Trail")
+            f_beDone := true
+            if not f_hideSignals
+                label.new(time, f_bePx, "BE", xloc=xloc.bar_time, style=label.style_label_left, color=color.new(color.orange, 20), textcolor=color.white, size=size.tiny)
+
+    // ── v12: longs overnight only — cancel a waiting long when the day session starts ──
+    f_dayNoLong = f_longsONOnly and f_inWin(f_closeMod, f_dayLStartH * 60 + f_dayLStartM, f_dayLEndH * 60 + f_dayLEndM)
+    if f_pending and f_pendDir == 1 and f_dayNoLong
+        strategy.cancel("F Long")
+        f_pending := false
+        if not na(f_entryLn)
+            line.set_extend(f_entryLn, extend.none)
+            line.set_x2(f_entryLn, time_close)
+
+    // ── v8: an order still waiting is cancelled when a blocked window starts ──
+    if f_pending and f_inBlock(f_closeMod)
+        strategy.cancel("F Long")
+        strategy.cancel("F Short")
+        f_pending := false
+        if not na(f_entryLn)
+            line.set_extend(f_entryLn, extend.none)
+            line.set_x2(f_entryLn, time_close)
+
+    // ── Sweep of any live zone (not on the candle that created it) -> entry at its POC against the sweep ──
+    f_blocked  = f_inWin(f_openMod, f_cutM, f_openM)                          // 15:00-18:00: no new setups
+    f_winOk    = not f_useWindow or f_inWin(f_openMod, f_winStartH * 60 + f_winStartM, f_winEndH * 60 + f_winEndM)
+    f_winOk   := f_winOk and not f_inBlock(f_closeMod)                      // v8: the entry would fill on the next candle
+    f_roomDay  = f_maxPerDay == 0 or f_tradesDay < f_maxPerDay
+    f_inPos = g_fPos != 0
+    // COMBINED: the Flip only looks for sweeps while flat or while it owns the trade (stay in the trade you are in),
+    // and not on a candle where the priority system (HTF) just set up a new trade.
+    if array.size(f_zHs) > 0 and (not f_inPos or f_useReverse) and not f_blocked and f_winOk and f_roomDay and (g_flat or g_fOwn) and not (g_prioHTF and g_hNew and not g_fOwn)
+        int   f_d  = 0
+        int   f_jj = -1
+        f_posNow   = g_fPos > 0 ? 1 : g_fPos < 0 ? -1 : 0
+        f_holdNow  = f_useTrendHold and f_posNow != 0 and f_isTrending and (not f_holdWithTrend or f_posNow == f_trendDir)
+        f_holdAll  = f_holdScope == "All zones (D-0 too)"
+        for f_j = array.size(f_zHs) - 1 to 0                            // newest zone first
+            // v10 trend-day hold: while in a trade, ignored zones cannot signal (no reversal / exit)
+            if array.get(f_zTs, f_j) != time and not (f_holdNow and (f_holdAll or array.get(f_zAge, f_j) >= 1))
+                f_hh = array.get(f_zHs, f_j)
+                f_ll = array.get(f_zLs, f_j)
+                f_sweptLow  = low  < f_ll and (not f_needClose or close > f_ll)
+                f_sweptHigh = high > f_hh and (not f_needClose or close < f_hh)
+                if f_sweptLow != f_sweptHigh
+                    f_d  := f_sweptLow ? 1 : -1
+                    f_jj := f_j
+                    break
+        f_posDir = g_fPos > 0 ? 1 : g_fPos < 0 ? -1 : 0
+        if f_posDir != 0 and f_d == f_posDir                              // same direction as the open trade -> ignore
+            f_d := 0
+        f_isRev = f_d != 0 and f_posDir != 0                              // opposite direction -> reversal
+        if f_d != 0
+            f_zH = array.get(f_zHs, f_jj)
+            f_zL = array.get(f_zLs, f_jj)
+            f_zP = array.get(f_zPs, f_jj)
+            f_zk = array.get(f_zAge, f_jj)
+            f_zid = array.get(f_zTs, f_jj)
+            f_lastZH := f_zH, f_lastZL := f_zL, f_lastZP := f_zP
+            f_dirOk  = (f_dirFilter == "Both" or (f_dirFilter == "Longs only" and f_d == 1) or (f_dirFilter == "Shorts only" and f_d == -1)) and not (f_d == 1 and f_dayNoLong)   // v12: no day-session longs
+            f_tk     = syminfo.mintick
+            f_mktRev = f_isRev and f_revEntry == "Market (next candle open)"
+            f_ent    = f_mktRev ? close : f_zP                            // market reversal fills near this close
+            f_stp    = f_stopMode == "Beyond the sweep candle" ? (f_d == 1 ? low - f_stopBuf * f_tk : high + f_stopBuf * f_tk) : f_stopMode == "Beyond the zone edge" ? (f_d == 1 ? f_zL - f_stopBuf * f_tk : f_zH + f_stopBuf * f_tk) : f_ent - f_d * f_stopTicks * f_tk
+            f_risk   = math.abs(f_ent - f_stp)
+            f_tgt    = f_tgtMode == "Opposite zone edge" ? (f_d == 1 ? f_zH : f_zL) : f_tgtMode == "R multiple" ? f_ent + f_d * f_tgtR * f_risk : na
+            f_okStop = f_risk > 0 and (f_maxStopPts == 0 or f_risk <= f_maxStopPts) and (f_d == 1 ? f_stp < f_ent : f_stp > f_ent)
+            f_okTgt  = na(f_tgt) or (f_d == 1 ? f_tgt > f_ent : f_tgt < f_ent)
+            if f_dirOk and f_okStop and f_okTgt and c_okFlip(f_d) and e_entryOK
+                f_curTgt := f_tgt
+                if f_pending                                          // a newer sweep replaces the waiting order
+                    strategy.cancel("F Long")
+                    strategy.cancel("F Short")
+                    if not na(f_entryLn)
+                        line.set_extend(f_entryLn, extend.none)
+                        line.set_x2(f_entryLn, time_close)
+                f_pending  := true
+                if not g_prioHTF and g_hNew and not g_fOwn         // COMBINED: Flip has priority -> cancel HTF's same-candle setup
+                    strategy.cancel("H Long")
+                    strategy.cancel("H Short")
+                    g_hKill := true
+                f_pendDir  := f_d
+                f_pendBar  := bar_index
+                f_pendZone := f_zid
+                f_pendCnt  := strategy.closedtrades + strategy.opentrades
+                if f_enableTrading and f_isRev and not f_mktRev
+                    strategy.close_all(comment="FLIP Reverse")          // POC mode: exit now, new entry rests at the POC
+                if f_enableTrading and f_mktRev                           // market: the opposite entry closes and flips in one order
+                    f_nmR = (f_d == 1 ? "Rev Long" : "Rev Short") + " D-" + str.tostring(f_zk)
+                    if f_d == 1
+                        strategy.entry("F Long", strategy.long, qty=f_qty, comment="FLIP " + f_nmR, oca_name="ENTRY", oca_type=strategy.oca.cancel)
+                        strategy.exit("F Long Exit", from_entry="F Long", stop=f_stp, limit=f_tgt, trail_points=f_trPts, trail_offset=f_trOff, comment_loss="FLIP SL", comment_profit="FLIP TP", comment_trailing="FLIP Trail")
+                    else
+                        strategy.entry("F Short", strategy.short, qty=f_qty, comment="FLIP " + f_nmR, oca_name="ENTRY", oca_type=strategy.oca.cancel)
+                        strategy.exit("F Short Exit", from_entry="F Short", stop=f_stp, limit=f_tgt, trail_points=f_trPts, trail_offset=f_trOff, comment_loss="FLIP SL", comment_profit="FLIP TP", comment_trailing="FLIP Trail")
+                else if f_enableTrading
+                    f_nm = (f_isRev ? (f_d == 1 ? "Rev Long" : "Rev Short") : (f_d == 1 ? "Flip Long" : "Flip Short")) + " D-" + str.tostring(f_zk)
+                    f_pastPoc = f_d == 1 ? close > f_ent : close < f_ent    // already beyond the POC -> wait for the pullback
+                    if f_d == 1
+                        if f_pastPoc
+                            strategy.entry("F Long", strategy.long, qty=f_qty, limit=f_ent, comment="FLIP " + f_nm, oca_name="ENTRY", oca_type=strategy.oca.cancel)
+                        else
+                            strategy.entry("F Long", strategy.long, qty=f_qty, stop=f_ent, comment="FLIP " + f_nm, oca_name="ENTRY", oca_type=strategy.oca.cancel)
+                        strategy.exit("F Long Exit", from_entry="F Long", stop=f_stp, limit=f_tgt, trail_points=f_trPts, trail_offset=f_trOff, comment_loss="FLIP SL", comment_profit="FLIP TP", comment_trailing="FLIP Trail")
+                    else
+                        if f_pastPoc
+                            strategy.entry("F Short", strategy.short, qty=f_qty, limit=f_ent, comment="FLIP " + f_nm, oca_name="ENTRY", oca_type=strategy.oca.cancel)
+                        else
+                            strategy.entry("F Short", strategy.short, qty=f_qty, stop=f_ent, comment="FLIP " + f_nm, oca_name="ENTRY", oca_type=strategy.oca.cancel)
+                        strategy.exit("F Short Exit", from_entry="F Short", stop=f_stp, limit=f_tgt, trail_points=f_trPts, trail_offset=f_trOff, comment_loss="FLIP SL", comment_profit="FLIP TP", comment_trailing="FLIP Trail")
+                if not f_hideSignals
+                    label.new(time, f_d == 1 ? low : high, (f_d == 1 ? "Swept low → BUY POC" : "Swept high → SELL POC") + " (D-" + str.tostring(f_zk) + ")", xloc=xloc.bar_time, style=f_d == 1 ? label.style_label_up : label.style_label_down, textcolor=color.white, color=color.new(f_d == 1 ? color.green : color.red, 20), size=size.small)
+                    f_entryLn := line.new(time_close, f_ent, time_close, f_ent, xloc=xloc.bar_time, extend=extend.right, color=f_d == 1 ? color.lime : color.red, width=1, style=line.style_dotted)
+
+    // ── 10:00 candle closes -> it becomes a new zone (D-0) from the next candle on ──
+    if f_isZoneBar
+        array.push(f_zHs, high), array.push(f_zLs, low), array.push(f_zPs, f_cPoc), array.push(f_zTs, time), array.push(f_zAge, 0)
+        array.push(f_zBx, f_showZone ? box.new(time, high, time_close, low, xloc=xloc.bar_time, border_color=color.new(color.yellow, 40), bgcolor=f_zoneCol, text="D-0", text_size=size.tiny, text_color=color.new(color.yellow, 30), text_halign=text.align_left, text_valign=text.align_top) : na)
+        array.push(f_zLn, f_showZone ? line.new(time, f_cPoc, time_close, f_cPoc, xloc=xloc.bar_time, color=f_zPocCol, width=2) : na)
+        if array.size(f_zHs) > 12
+            f_retireZone(0)
+
+    // flat for OVERNIGHT trades (entry filled inside the overnight window) at 09:00
+    f_onFlatM = f_onFlatHour * 60 + f_onFlatMin
+    f_onNow   = (f_closeMod == f_onFlatM) or (f_inWin(f_onFlatM, f_openMod, f_closeMod) and f_openMod != f_onFlatM)
+    if f_useOnFlat and f_onNow and g_fPos != 0 and strategy.opentrades > 0
+        f_entT = strategy.opentrades.entry_time(strategy.opentrades - 1)
+        if f_inWin(f_modOf(f_entT), f_onStartH * 60 + f_onStartM, f_onEndH * 60 + f_onEndM)
+            strategy.close_all(comment="FLIP ON Flat " + str.format("{0,number,00}:{1,number,00}", f_onFlatHour, f_onFlatMin), immediately=true)
+
+    // flat at EOD (and on early closes) — day trades and anything still open
+    f_eodNow = (f_closeMod == f_eodHour * 60 + f_eodMin) or (f_inWin(f_eodHour * 60 + f_eodMin, f_openMod, f_closeMod) and f_openMod != f_eodHour * 60 + f_eodMin) or session.islastbar
+    if f_eodNow and g_fPos != 0
+        strategy.close_all(comment="FLIP EOD", immediately=true)
+
+// ───────────── Candle POC + value area ─────────────
+if f_showVABox and barstate.isconfirmed and not na(f_cVah)
+    box.new(time, f_cVah, time_close, f_cVal, xloc=xloc.bar_time, border_color=color.new(color.gray, 100), bgcolor=f_vaBoxCol)
+plot(f_showPoc ? f_cPoc : na, title="POC", color=f_pocCol, style=plot.style_circles, linewidth=3)
+plot(f_showVA ? f_cVah : na, title="VAH", color=f_vahCol, style=plot.style_cross, linewidth=1)
+plot(f_showVA ? f_cVal : na, title="VAL", color=f_valCol, style=plot.style_cross, linewidth=1)
+
+// ───────────── 10 am / 2 pm candle high & low: run until crossed ─────────────
+var array<line>  f_keyLines = array.new<line>(0)
+var array<float> f_keyLvls  = array.new<float>(0)
+var array<int>   f_keySide  = array.new<int>(0)
+f_addKeyLine(float f_lvl, int f_side, color f_c, string f_txt) =>
+    array.push(f_keyLines, line.new(time, f_lvl, time_close, f_lvl, xloc=xloc.bar_time, extend=extend.right, color=f_c, width=2, style=f_side == 1 ? line.style_solid : line.style_dashed))
+    array.push(f_keyLvls, f_lvl)
+    array.push(f_keySide, f_side)
+    label.new(time, f_lvl, f_txt, xloc=xloc.bar_time, style=label.style_label_right, color=color.new(color.black, 100), textcolor=f_c, size=size.small)
+    if array.size(f_keyLines) > 40
+        line.delete(array.shift(f_keyLines))
+        array.shift(f_keyLvls)
+        array.shift(f_keySide)
+    true
+if f_showKey and barstate.isconfirmed and f_intraday
+    if array.size(f_keyLines) > 0
+        for f_i = array.size(f_keyLines) - 1 to 0
+            f_lvl  = array.get(f_keyLvls, f_i)
+            f_side = array.get(f_keySide, f_i)
+            if f_side == 1 ? high > f_lvl : low < f_lvl
+                f_ln = array.get(f_keyLines, f_i)
+                if f_keepCrossed
+                    line.set_extend(f_ln, extend.none)
+                    line.set_x2(f_ln, time_close)
+                else
+                    line.delete(f_ln)
+                array.remove(f_keyLines, f_i)
+                array.remove(f_keyLvls, f_i)
+                array.remove(f_keySide, f_i)
+    if f_isZoneBar
+        f_addKeyLine(high, 1, f_k1Col, "10a High")
+        f_addKeyLine(low, -1, f_k1Col, "10a Low")
+    if f_isK2Bar and f_showK2
+        f_addKeyLine(high, 1, f_k2Col, "2p High")
+        f_addKeyLine(low, -1, f_k2Col, "2p Low")
+
+// ───────────── Data window ─────────────
+plot(f_lastZH, title="Zone High (last traded)", display=display.data_window)
+plot(f_lastZL, title="Zone Low (last traded)", display=display.data_window)
+plot(f_lastZP, title="Zone POC (last traded)", display=display.data_window)
+plot(array.size(f_zHs), title="Live Zones", display=display.data_window)
+plot(f_pending ? 1 : 0, title="Order Waiting to Fill", display=display.data_window)
+plot(f_isTrending ? f_trendDir : 0, title="Trend Day (1 up / -1 down / 0 no)", display=display.data_window)
+plot(f_rPoc2, title="2 pm POC (regime)", display=display.data_window)
+plot(f_rPoc6, title="6 am POC (regime)", display=display.data_window)
+plot(c_cdvSide, title="CDV lines (1 green over red / -1 red over green)", display=display.data_window)
+plot(c_cdvHA, title="HA CDV candle (1 green / -1 red)", display=display.data_window)
+plot(e_entryOK ? 1 : 0, title="Entry hour/day allowed (1 = yes)", display=display.data_window)
+bgcolor(f_showRegimeBg and f_intraday and f_isTrending ? (f_trendDir == 1 ? f_upBgCol : f_dnBgCol) : na, title="Trend Day")
